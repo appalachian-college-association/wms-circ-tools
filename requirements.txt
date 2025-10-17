@@ -1,0 +1,6 @@
+# requirements.txt for OCLC WMS Circulation Tools
+# Python 3.9+ required
+
+paramiko>=2.12.0
+python-dotenv>=1.0.0
+pandas>=2.3.0

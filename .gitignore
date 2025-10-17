@@ -1,0 +1,38 @@
+
+# --- Temporarily ignore for initial load ---
+SAMPLE_patron_skips.txt
+
+# --- Environment and secrets ---
+.env
+.venv/
+.vscode/
+.idea/
+.DS_Store
+
+# --- Local edit history / scratch ---
+.history/
+patron_skips.txt
+patron_updates.txt
+
+# --- Python caches ---
+__pycache__/
+*.py[cod]
+
+# --- Logs and runtime output ---
+logs/
+*.log
+
+# --- sFTP and report data (generated) ---
+patrons/
+reports/
+
+# --- Local-only utilities ---
+lookup.txt
+*.bat
+*.yaml
+
+# --- Test or build caches ---
+.pytest_cache/
+.coverage
+htmlcov/
+

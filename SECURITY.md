@@ -1,0 +1,1 @@
+Don’t post patron data in issues; remove PII before sharing logs.

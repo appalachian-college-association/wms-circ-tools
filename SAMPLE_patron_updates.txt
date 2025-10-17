@@ -1,0 +1,5 @@
+# SAMPLE patron update file - tab-delimited. Add columns as needed per headers_formattedpatron.txt
+
+patron_barcode_old	patron_barcode_new
+123old	123new
+456old	456new
