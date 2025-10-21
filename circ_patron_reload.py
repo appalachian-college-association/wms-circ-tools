@@ -348,7 +348,7 @@ def find_most_common_source_system(df: pd.DataFrame, column_name: str) -> str:
                 f"(appears {system_counts[most_common_system]} times)")
     return most_common_system
 
-def process_special_fields(in_df: pd.DataFrame) -> pd.DataFrame:
+def process_special_fields(in_df: pd.DataFrame, skip_columns: list = None) -> pd.DataFrame:
     """
     Process idAtSource and sourceSystem fields to extract clean values.
     Handles pipe-delimited junk data by taking the first part.
@@ -356,11 +356,18 @@ def process_special_fields(in_df: pd.DataFrame) -> pd.DataFrame:
     WARNING: If values have been updated over time, old values may appear
     first in the pipe-delimited list. REVIEW the log output and verify your
     output file before uploading!
+    
+    Args:
+        in_df: Input DataFrame
+        skip_columns: List of column names to skip processing (already updated via patron_updates.txt)
     """
+    if skip_columns is None:
+        skip_columns = []
+    
     df = in_df.copy()
     
     # Process idAtSource
-    if "Patron_User_ID_At_Source" in df.columns:
+    if "Patron_User_ID_At_Source" in df.columns and "Patron_User_ID_At_Source" not in skip_columns:
         logger.info("Processing idAtSource field...")
         
         # Analyze the data first
@@ -375,9 +382,11 @@ def process_special_fields(in_df: pd.DataFrame) -> pd.DataFrame:
         non_empty = df["Patron_User_ID_At_Source"][df["Patron_User_ID_At_Source"] != ""]
         if not non_empty.empty:
             logger.info(f"Sample extracted idAtSource values: {non_empty.head(3).tolist()}")
+    elif "Patron_User_ID_At_Source" in skip_columns:
+        logger.info("Skipping idAtSource processing - using values from patron_updates.txt")
     
     # Process sourceSystem
-    if "Patron_Source_System" in df.columns:
+    if "Patron_Source_System" in df.columns and "Patron_Source_System" not in skip_columns:
         logger.info("Processing sourceSystem field...")
         
         # Analyze the data first
@@ -391,6 +400,8 @@ def process_special_fields(in_df: pd.DataFrame) -> pd.DataFrame:
         else:
             logger.warning("No valid sourceSystem value found, leaving column empty")
             df["Patron_Source_System"] = ""
+    elif "Patron_Source_System" in skip_columns:
+        logger.info("Skipping sourceSystem processing - using values from patron_updates.txt")
     
     return df
 
@@ -711,10 +722,25 @@ def build_formatted_df(
     ) -> pd.DataFrame:
     """Create a DataFrame with 46 columns in the exact order from headers."""
     
-    # First, process special fields that need cleaning
+    # Determine which columns were updated via patron_updates.txt
+    # These should NOT be processed by process_special_fields
+    skip_processing = []
+    if "idAtSource" in in_df.columns:
+        # Check if any non-empty values exist (indicating updates were applied)
+        if (in_df["idAtSource"] != "").any():
+            skip_processing.append("Patron_User_ID_At_Source")
+            logger.info("Detected idAtSource updates - will preserve patron_updates.txt values")
+    
+    if "sourceSystem" in in_df.columns:
+        # Check if any non-empty values exist (indicating updates were applied)
+        if (in_df["sourceSystem"] != "").any():
+            skip_processing.append("Patron_Source_System")
+            logger.info("Detected sourceSystem updates - will preserve patron_updates.txt values")
+    
+    # Process special fields that need cleaning (but skip columns that were updated)
     if use_source_value:
         logger.info("Processing source fields (--use-source-value enabled)")
-        processed_df = process_special_fields(in_df)
+        processed_df = process_special_fields(in_df, skip_columns=skip_processing)
     else:
         logger.info("Skipping source field processing (use --use-source-value to enable)")
         processed_df = in_df.copy()
@@ -729,16 +755,29 @@ def build_formatted_df(
 
         # Special handling for source fields
         if formatted_col in ("idAtSource", "sourceSystem"):
-            # Priority: 1) Values from filtering, 2) --use-source-value flag, 3) empty
-            if formatted_col == "idAtSource" and "matched_email" in processed_df.columns:
-                # Use matched email as idAtSource if available
+            # Priority order:
+            # 1) Values from patron_updates.txt (columns named idAtSource/sourceSystem)
+            # 2) Values from filtering (matched_email, source_system_value)
+            # 3) --use-source-value flag (extract from OCLC via Patron_User_ID_At_Source/Patron_Source_System)
+            # 4) Empty string
+            
+            # Check if this value was updated via patron_updates.txt
+            if formatted_col in processed_df.columns and (processed_df[formatted_col] != "").any():
+                # Use the value from patron_updates.txt (preserves updates)
+                out[formatted_col] = processed_df[formatted_col].astype(str).fillna("")
+                logger.info(f"Using {formatted_col} values from patron_updates.txt")
+            elif formatted_col == "idAtSource" and "matched_email" in processed_df.columns:
+                # Use matched email as idAtSource if available (from filtering)
                 out[formatted_col] = processed_df["matched_email"].astype(str).fillna("")
             elif formatted_col == "sourceSystem" and "source_system_value" in processed_df.columns:
-                # Use specified source system value if available
+                # Use specified source system value if available (from filtering)
                 out[formatted_col] = processed_df["source_system_value"].astype(str).fillna("")
-            elif use_source_value and incoming_col != "" and incoming_col in processed_df.columns:
-                # Fall back to --use-source-value behavior
-                out[formatted_col] = processed_df[incoming_col].astype(str).fillna("")
+            elif formatted_col == "idAtSource" and "Patron_User_ID_At_Source" in processed_df.columns:
+                # Fall back to processed OCLC value
+                out[formatted_col] = processed_df["Patron_User_ID_At_Source"].astype(str).fillna("")
+            elif formatted_col == "sourceSystem" and "Patron_Source_System" in processed_df.columns:
+                # Fall back to processed OCLC value
+                out[formatted_col] = processed_df["Patron_Source_System"].astype(str).fillna("")
             else:
                 out[formatted_col] = ""
             continue
@@ -860,7 +899,9 @@ def apply_patron_updates_if_any(
         "homeBranch": "Patron_Home_Branch_ID",
         "emailAddress": "Patron_Email_Address",
         "username": "Patron_Username",
-        "illId": "illId"
+        "illId": "illId",
+        "idAtSource": "Patron_User_ID_At_Source",
+        "sourceSystem": "Patron_Source_System" 
         # Add other fields as needed
     }
     
@@ -897,7 +938,7 @@ def apply_patron_updates_if_any(
     keep_cols = [c for c in merged.columns if c in in_df.columns]
     
     # Preserve special columns that aren't in the incoming file but need to flow through
-    special_cols = ["canSelfEdit", "illId"]
+    special_cols = ["canSelfEdit", "illId", "idAtSource", "sourceSystem"]
     for col in special_cols:
         if col in merged.columns and col not in in_df.columns:
             keep_cols.append(col)
