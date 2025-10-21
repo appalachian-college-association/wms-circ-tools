@@ -1,13 +1,11 @@
 import os
 import re
-import base64
-import hashlib
 import argparse
 import paramiko
 from typing import Tuple
 from dotenv import load_dotenv
 from datetime import datetime, date
-from sftp_utils import get_credentials, connect_sftp, list_remote_files, download_file, print_server_fingerprint
+from sftp_utils import get_credentials, connect_sftp, list_remote_files, print_server_fingerprint
 
 
 def parse_boolean(value, default=False):

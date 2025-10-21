@@ -11,7 +11,6 @@ Common upload destinations:
 Used by: circ_patron_reload.py, delete_expired_patrons.py
 """
 
-import os
 import logging
 from pathlib import Path
 from typing import Optional
@@ -174,7 +173,7 @@ def confirm_delete_upload(delete_file: Path) -> bool:
         True if user confirms, False otherwise
     """
     print(f"\n{'='*60}")
-    print("⚠️  UPLOAD CONFIRMATION REQUIRED")
+    print("UPLOAD CONFIRMATION REQUIRED")
     print(f"{'='*60}")
     print(f"Delete file: {delete_file.name}")
     print(f"Location:    {delete_file}")
@@ -194,7 +193,7 @@ def confirm_delete_upload(delete_file: Path) -> bool:
         print(f"\nCould not read file details: {e}")
     
     print(f"\nDestination: /xfer/wms/in/pdelete/")
-    print("\n⚠️  WARNING: This will PERMANENTLY DELETE patron records!")
+    print("\nWARNING: This will PERMANENTLY DELETE patron records!")
     print("Please review the file carefully before proceeding.")
     
     # Get user confirmation
