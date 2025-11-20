@@ -108,9 +108,6 @@ python data_fetcher.py wx_abc --patrons --since 2025-08-01
 python data_fetcher.py wx_abc --stats --since 2025-09-01
 ```
 
-**Use previously downloaded file to reload all patrons with a new source system ID (use email address with filter to identify user idAtSource and upload to the WMS sFTP test directory**:
-py circ_patron_reload.py wx_wvb --offline --filter-email-domain "@bethanywv.edu" --set-idsource-from-email --source-system "https://sts.windows.net/e7f0b6cf-3723-46f1-a1ea-e81e6753374d/" --upload-test
-
 **Get server fingerprint for initial setup**:
 ```bash
 python data_fetcher.py --print_fingerprint
@@ -811,4 +808,3 @@ Add notes to your commit messages about which library and what operation.
 - **GitHub issues**: Open an issue with your error message
 - **Security concerns**: Verify fingerprint before trusting connections
 
-Remember: These tools are built by librarians, for librarians. Don't hesitate to ask questions!
