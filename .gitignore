@@ -30,6 +30,7 @@ reports/
 lookup.txt
 *.bat
 *.yaml
+*.json
 
 # --- Test or build caches ---
 .pytest_cache/

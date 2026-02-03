@@ -117,7 +117,7 @@ python circ_patron_reload.py wx_abc
 # Use most recent file from patrons/downloads/ABC.*.txt (no upload)
 # For a custom file, save as .txt with pipe delimiters and always quote text
 # For an OpenRefine custom tab report from *_Patron_Report_Full*, apply open_refine_option_code.json to format
-python circ_patron_reload.py wx_abc --offline
+python circ_patron_reload.py wx_abc --offline --use-source-value
 
 # Upload reload file from patrons/reloads/ABC.*.txt to OCLC
 python circ_patron_reload.py wx_abc --upload
