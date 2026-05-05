@@ -16,6 +16,7 @@ These tools are designed for library staff working with WMS circulation data, wi
 
 ### Patron Management Tools
 - **`data_fetcher.py`** - Download circulation reports and patron files from OCLC SFTP
+- **`data_fetcher_openrefine.py`** - Download circulation reports and patron files from OCLC SFTP with formatting for openrefine loading
 - **`circ_patron_reload.py`** - Build patron reload files with optional updates (barcodes, email, etc.)
 - **`delete_expired_patrons.py`** - Generate delete files for expired patron accounts
 
@@ -116,10 +117,11 @@ python circ_patron_reload.py wx_abc
 
 # Use most recent file from patrons/downloads/ABC.*.txt (no upload)
 # For a custom file, save as .txt with pipe delimiters and always quote text
-# For an OpenRefine custom tab report from *_Patron_Report_Full*, apply open_refine_option_code.json to format
+# For an OpenRefine custom tab report from *_Patron_Report_Full*, apply open_refine_option_code.json to format "original" with pipes for patron reload
+# Temporarily rename file in patrons/downloads/ABC.*.txt as ABC.Circulation_Patron_Report_Full.YYYYmmDD.txt (then replace "Full" with "Reload" after completion)
 python circ_patron_reload.py wx_abc --offline --use-source-value
 
-# Upload reload file from patrons/reloads/ABC.*.txt to OCLC
+# Upload formatted reload file from patrons/reloads/ABC.*.txt to OCLC 
 python circ_patron_reload.py wx_abc --upload
 ```
 
