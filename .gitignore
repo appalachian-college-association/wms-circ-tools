@@ -13,6 +13,7 @@ SAMPLE_patron_skips.txt
 .history/
 patron_skips.txt
 patron_updates.txt
+check_list.txt
 
 # --- Python caches ---
 __pycache__/

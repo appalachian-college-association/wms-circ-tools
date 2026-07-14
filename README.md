@@ -108,6 +108,9 @@ python data_fetcher.py wx_abc --patrons --since 2025-09-01
 
 # Download ten (10) latest available stats (patron load reports)
 python data_fetcher.py wx_abc --stats --recent 10
+
+# Download data formatted for OpenRefine import
+python data_fetcher_openrefine.py wx_abc --recent 
 ```
 
 ### Update Patron Records
@@ -122,6 +125,7 @@ python circ_patron_reload.py wx_abc
 python circ_patron_reload.py wx_abc --offline --use-source-value
 
 # Upload formatted reload file from patrons/reloads/ABC.*.txt to OCLC 
+# Logs retained in /logs as ABCtypeaction_MMDDYY.log
 python circ_patron_reload.py wx_abc --upload
 ```
 

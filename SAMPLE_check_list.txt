@@ -1,0 +1,7 @@
+# SAMPLE patron search file - tab-delimited. Replace placeholders with your data.
+# single-column list can include any WMS identifier: idAtSource, username, barcode, email
+
+email.name@your-institution.edu
+ed12401b-ed42-43e8-ab77-63fe025ec412 # sample OCLC IDM User ID at Source
+1245393 # sample barcode 
+username # OCLC username
