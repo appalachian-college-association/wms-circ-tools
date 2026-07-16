@@ -7,6 +7,7 @@ Comprehensive guide to patron management scripts for OCLC WMS.
 - [data_fetcher.py - Download Reports](#data_fetcherpy---download-reports)
 - [circ_patron_reload.py - Patron Reloads](#circ_patron_reloadpy---patron-reloads)
 - [delete_expired_patrons.py - Delete Expired Patrons](#delete_expired_patronspy---delete-expired-patrons)
+- [idm_blank_patron_tool.py - Blank-Name Patron Review & Delete](#idm_blank_patron_toolpy---blank-name-patron-review--delete)
 - [Required Files](#required-files)
 - [patron_updates.txt Format](#patron_updatestxt-format)
 - [Advanced Usage](#advanced-usage)
@@ -81,7 +82,7 @@ python data_fetcher.py <lib_code> [options]
 | `--stats` | flag | Download circulation statistics | Downloads items (default) |
 | `--recent [N]` | optional int | Download N most recent files | All files if omitted; 1 if flag used without number |
 | `--since DATE` | date | Only download files on/after DATE (YYYY-MM-DD or YYYYMMDD) | No date filter |
-| `--print_fingerprint` | flag | Print server fingerprint and exit | Normal operation |
+| `--print-fingerprint` | flag | Print server fingerprint and exit | Normal operation |
 
 
 **Note**: `--patrons` and `--stats` are mutually exclusive. If neither is specified, the script downloads item inventory files (default).
@@ -110,7 +111,7 @@ python data_fetcher.py wx_abc --stats --since 2025-09-01
 
 **Get server fingerprint for initial setup**:
 ```bash
-python data_fetcher.py --print_fingerprint
+python data_fetcher.py --print-fingerprint
 ```
 (No lib_code needed for this operation)
 
@@ -356,7 +357,6 @@ python delete_expired_patrons.py <lib_code> [options]
 | `--headers-file` | path | Path to delete headers file | `headers_deletes.txt` |
 | `--barcode-column` | name | Column name for patron barcode | `Patron_Barcode` |
 | `--expiration-column` | name | Column name for expiration date | `Patron_Expiration_Date` |
-| `--print-fingerprint` | flag | Print server fingerprint and exit | Normal operation |
 
 ### Examples
 
@@ -479,6 +479,173 @@ Type 'yes' to upload, 'no' to cancel:
 **"Column not found: Patron_Expiration_Date"**:
 - Your patron file doesn't include expiration dates
 - Ensure you're using a "Full" patron report from OCLC
+
+---
+
+## idm_blank_patron_tool.py - Blank-Name Patron Review & Delete
+
+Finds and (optionally) deletes "blank-name" patron records -- the ghost records
+that cause duplicate-barcode errors on reload -- by looking them up directly in
+WMS through OCLC's Identity Management (IDM) API.
+
+### How This Tool Is Different
+
+Unlike every other script in this repo, this tool does **not** use OCLC SFTP. It
+talks to OCLC over a web API (SCIM/IDM) using OAuth2, which requires a different
+kind of credential (a **WSKey**: a Client ID + Client Secret) than your SFTP
+`_USER`/`_PASS` values.
+
+**Why it exists**: Records created directly in WMS Admin (not through a
+source-system data load) can end up with no name attached. These blank records
+don't appear in your `Circulation_Patron_Report_Full` download, so the other
+tools can't see them -- but they still collide on barcode when you reload
+patrons with source values, causing a duplicate-barcode error. This tool lets
+you check specific barcodes/emails against WMS so you can find and remove them
+before a reload.
+
+**One record at a time**: The API can only look up a single barcode or email at
+a time -- there's no "give me every blank record" option. That's why this tool
+works from a list you provide, rather than scanning everything automatically.
+
+### Prerequisites
+
+Add these to your `.env` file (separate from your SFTP credentials), keyed by
+your library symbol (the part after the underscore, uppercased):
+
+```env
+ABC_IDM_CLIENT_ID=your-wskey-client-id
+ABC_IDM_CLIENT_SECRET=your-wskey-client-secret
+```
+
+The tool reuses your existing `ABC_INSTITUTION_ID` value -- the IDM API calls
+this the "registry ID" and it's the same number. You must have a WSKey issued by
+OCLC with the Identity Management **SCIM** scopes enabled (`SCIM:read_user` for
+review, `SCIM:delete_user` for delete).
+
+> **Note**: The OAuth token request uses the standard client-credentials pattern
+> with HTTP Basic authentication. If the first run fails with a `401` on the
+> token step, confirm with OCLC whether your WSKey expects the client
+> credentials as a Basic auth header (what this tool sends) or in the request
+> body, and that SCIM scopes are enabled.
+
+### Basic Usage
+
+```bash
+# Step 1 - review (read-only)
+python idm_blank_patron_tool.py <lib_code> --review <input_file>
+
+# Step 2 - delete (destructive, after editing the review CSV)
+python idm_blank_patron_tool.py <lib_code> --delete <review_csv>
+```
+
+**Required**:
+- `lib_code` - Your library code (e.g., `wx_abc`)
+- Exactly one of `--review` or `--delete` (they are mutually exclusive)
+
+### CLI Flags
+
+| Flag | Type | Description | Default |
+|------|------|-------------|---------|
+| `--review` | path | Text file of barcodes/emails/usernames/PPIDs, one per line (read-only) | — |
+| `--delete` | path | A reviewed CSV from a previous `--review` run | — |
+| `--output-dir` | path | Where review and delete-log CSVs are written | `patrons/idm_review` |
+
+**Note**: `--review` and `--delete` are mutually exclusive, and one is required.
+
+### Two-Step Safety Workflow
+
+This follows the same review-then-confirm pattern as `delete_expired_patrons.py`.
+
+**Step 1 — Review** (safe, read-only, changes nothing):
+
+```bash
+python idm_blank_patron_tool.py wx_abc --review check_list.txt
+```
+
+`check_list.txt` is a plain text file you create, with one value per line. Each
+line can be a barcode, an email address, an OCLC username, or a principal ID
+(PPID). For example:
+```
+270236
+acbethany
+knedrow@example.edu
+```
+This writes a CSV report to `patrons/idm_review/ABC_idm_review_YYYYMMDD_HHMMSS.csv`
+showing what was found for each value, including a `blank_name` (Yes/No) column.
+
+**Step 2 — Delete** (destructive, requires manual sign-off twice):
+
+```bash
+python idm_blank_patron_tool.py wx_abc --delete patrons/idm_review/ABC_idm_review_YYYYMMDD_HHMMSS.csv
+```
+
+Open the review CSV from Step 1 in Excel. For each row where `blank_name = Yes`
+that you want removed, type `YES` (all capitals) into the `confirm_delete`
+column, then save. The tool deletes **only** rows where **both**
+`blank_name = Yes` **and** `confirm_delete = YES` (and a non-empty
+`principal_id`), and it prints the exact list and asks you to type `yes` one more
+time before deleting anything.
+
+### How Lookups Work
+
+For each value, the tool tries in order:
+1. If the value looks like a PPID/UUID, it looks the record up directly by
+   principal ID (`GET /Users/{id}`) -- useful for records identifiable only by
+   the username/PPID visible in a WMS Admin record's URL.
+2. Otherwise it searches `External_ID` (matches a barcode **or** a
+   correlation/source-system ID), then `EMAIL_ADDRESS`, stopping at the first
+   match. A value is matched by `External_ID` first even if it contains `@`,
+   since correlation IDs can look like emails.
+
+If more than one record matches, the row is flagged `MULTIPLE MATCHES FOUND` for
+manual review. Calls are paced at ~0.6s each to stay under OCLC's 120 req/min
+limit.
+
+### Review CSV Columns
+
+| Column | Meaning |
+|--------|---------|
+| `searched_value` | The value from your input file |
+| `search_type` | Which filter matched (`External_ID`, `email`, direct lookup, or "no match") |
+| `match_found` | `Yes`/`No` |
+| `principal_id` | The record's PPID (required for deletion) |
+| `institution_id` | Registry ID on the record |
+| `given_name`, `family_name` | Name fields (blank on ghost records) |
+| `oclc_username` | OCLC login username |
+| `source_system`, `id_at_source` | Correlation info, if present |
+| `created`, `last_modified` | Record timestamps |
+| `blank_name` | `Yes` if both name fields are empty |
+| `confirm_delete` | **You fill this in** — type `YES` to authorize deletion |
+| `notes` | Warnings (e.g. multiple matches, search errors) |
+
+### Output Location
+
+```
+patrons/
+└── idm_review/
+    ├── ABC_idm_review_YYYYMMDD_HHMMSS.csv       # From --review
+    └── ABC_idm_delete_log_YYYYMMDD_HHMMSS.csv   # From --delete (audit log)
+```
+
+### Troubleshooting
+
+**"Missing required .env values"**:
+- Add `ABC_IDM_CLIENT_ID`, `ABC_IDM_CLIENT_SECRET`, and `ABC_INSTITUTION_ID`
+  (replace `ABC` with your uppercase symbol)
+
+**"Failed to get access token (status 401)"**:
+- Verify the WSKey Client ID/Secret are correct
+- Confirm with OCLC that the WSKey has SCIM scopes enabled
+- Confirm whether OCLC expects Basic auth vs. request-body credentials
+
+**"No rows are marked for deletion"**:
+- A row needs `blank_name = Yes` **and** `confirm_delete = YES` (all capitals),
+  plus a non-empty `principal_id`, to be deleted
+
+**A record you know exists isn't found**:
+- Records with no barcode, no correlation ID, and no email are invisible to
+  search. Use the PPID from the record's WMS Admin URL as the input value
+  instead (the tool will look it up directly)
 
 ---
 

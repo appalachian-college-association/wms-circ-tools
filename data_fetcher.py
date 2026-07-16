@@ -30,7 +30,7 @@ EXPECTED_FINGERPRINT = os.getenv("FINGERPRINT")
 HOST = os.getenv("HOST_NAME")
 PORT = int(os.getenv("HOST_PORT", "22"))
 
-DISCOVERY = False  # Toggle to True to discover fingerprint or run with CLI flag --print_fingerprint
+DISCOVERY = False  # Toggle to True to discover fingerprint or run with CLI flag --print-fingerprint
 
 CREDENTIALS = {
     key: os.getenv(key) for key in os.environ if key.endswith("_USER") or key.endswith("_PASS")
@@ -193,7 +193,7 @@ if __name__ == "__main__":
     else:
         # Nomal mode - require credentials from lib_code
         if not args.lib_code:
-            print("Error: lib_code is required when not using --print_fingerprint")
+            print("Error: lib_code is required when not using --print-fingerprint")
             print("Example: python data_fetcher.py wx_wvb")
             exit(1)
 

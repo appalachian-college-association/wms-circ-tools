@@ -9,6 +9,7 @@ This repository provides utilities to:
 - **Process** patron records for reload operations (updates, barcode changes)
 - **Generate** patron delete files for expired accounts
 - **Manage** patron data with validation and safety checks
+- **Find & remove** blank-name "ghost" patron records via the OCLC IDM API
 
 These tools are designed for library staff working with WMS circulation data, with varying levels of Python experience. Detailed documentation and examples are provided for each tool.
 
@@ -19,6 +20,7 @@ These tools are designed for library staff working with WMS circulation data, wi
 - **`data_fetcher_openrefine.py`** - Download circulation reports and patron files from OCLC SFTP with formatting for openrefine loading
 - **`circ_patron_reload.py`** - Build patron reload files with optional updates (barcodes, email, etc.)
 - **`delete_expired_patrons.py`** - Generate delete files for expired patron accounts
+- **`idm_blank_patron_tool.py`** - Review/delete blank-name "ghost" patron records via the OCLC IDM (SCIM) API (not sFTP)
 
 ### Helper Modules
 - **`sftp_utils.py`** - Shared SFTP connection and file transfer functions
@@ -36,7 +38,7 @@ These tools are designed for library staff working with WMS circulation data, wi
 
 ### Requirements
 - **Python 3.9+**
-- **Modules**: `paramiko`, `python-dotenv`, `pandas`
+- **Modules**: `paramiko`, `python-dotenv`, `pandas`, `requests`
 
 Install dependencies:
 ```bash
@@ -141,6 +143,17 @@ python delete_expired_patrons.py wx_abc --expiration-date 2025-01-15
 python delete_expired_patrons.py wx_abc --upload
 ```
 
+### Review and Delete Blank Patron Records Using check_list.txt Barcode or Email Entries
+```bash
+# Search OCLC IDM API patrons with no name data
+# IDM API key required in .env as ABC_IDM_CLIENT_ID and ABC_IDM_CLIENT_SECRET
+python idm_blank_patron_tool.py wx_abc --review check_list.txt
+
+# Open the review CSV and set confirm_delete=YES on the blank-name rows to remove
+# Delete confirmed blank patron records (requires confirmation)
+python idm_blank_patron_tool.py wx_abc --delete patrons/idm_review/ABC_idm_review_YYYYmmDD_HHmmSS.csv
+```
+
 ## File Organization
 
 The scripts automatically organize downloaded and processed files:
@@ -148,15 +161,19 @@ The scripts automatically organize downloaded and processed files:
 ```
 wms-circ-tools/
 ├── patrons/
-│   ├── downloads/        # Downloaded patron files
-│   ├── reloads/          # Generated reload files
-│   └── deletes/          # Generated delete files
+│   ├── deletes/                # Generated delete files 
+│   ├── downloads/              # Downloaded patron files
+│   ├── idm_review/             # Generated output from blank patron tool
+│   ├── reloads/                # Generated reload files
+│   └── reports/                # Generated reports from patron scripts
 ├── reports/
-│   └── ABC/              # Per-library folders
-│       ├── items/        # Item inventory reports
-│       ├── stats/        # Circulation statistics
-│       └── patrons/      # Patron reports
-└── logs/                 # Operation logs (delete history)
+│   └── ABC/                    # Per-library folders
+│       ├── items/              # Item inventory reports
+│       ├── items_openrefine/   # Item inventory reports with hashmarks replaced with '[hashmark]'
+│       ├── stats/              # Circulation statistics
+│       ├── patrons/            # Patron reports
+│       └── patrons_openrefine/ # Patron reports with hashmarks replaced with '[hashmark]'
+└── logs/                       # Operation logs (delete history)
 ```
 
 ## Safety Features
@@ -184,7 +201,7 @@ These tools include multiple safety checks:
 - Check that variable names are uppercase: `WX_ABC_USER`, not `wx_abc_user`
 
 **"Host key verification failed"**
-- Run `python data_fetcher.py --print_fingerprint`
+- Run `python data_fetcher.py --print-fingerprint`
 - Verify the fingerprint matches what FileZilla shows
 - Update `FINGERPRINT` in your `.env` file, including SHA256: prefix
 

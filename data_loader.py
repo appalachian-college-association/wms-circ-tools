@@ -54,34 +54,34 @@ def upload_file(sftp: paramiko.SFTPClient,
     # Verify local file exists
     if not local_path.exists():
         raise FileNotFoundError(f"Local file not found: {local_path}")
-    
+
     # Verify file has content
     file_size = local_path.stat().st_size
     if file_size == 0:
         raise ValueError(f"Cannot upload empty file: {local_path}")
-    
+
     # Use original filename if not specified
     if remote_filename is None:
         remote_filename = local_path.name
-    
+
     # Build remote path
     remote_path = remote_dir.rstrip('/\\') + '/' + remote_filename
-    
-    logger.info(f"Uploading: {local_path}")
-    logger.info(f"       to: {remote_path}")
-    logger.info(f"     Size: {file_size:,} bytes")
-    
+
+    logger.info("Uploading: %s", local_path)
+    logger.info("       to: %s", remote_path)
+    logger.info("     Size: %s bytes", f"{file_size:,}")
+
     try:
         sftp.put(str(local_path), remote_path)
         logger.info("Upload successful")
         return remote_path
-        
+
     except Exception as e:
-        logger.error(f"Upload failed: {e}")
+        logger.error("Upload failed: %s", e)
         raise
 
 
-def upload_patron_reload(lib_code: str, 
+def upload_patron_reload(lib_code: str,
                         local_file: Path,
                         verify_fingerprint: bool = True,
                         remote_dir: str = '/xfer/wms/in/patron') -> str:
@@ -107,7 +107,7 @@ def upload_patron_reload(lib_code: str,
     """
     user, pwd = get_credentials(lib_code)
     ssh, sftp = connect_sftp(user, pwd, verify=verify_fingerprint)
-    
+
     try:
         remote_path = upload_file(sftp, local_file, remote_dir)
         return remote_path
@@ -147,10 +147,10 @@ def upload_patron_delete(lib_code: str,
         if not confirm_delete_upload(local_file):
             logger.info("Upload cancelled by user")
             return None
-    
+
     user, pwd = get_credentials(lib_code)
     ssh, sftp = connect_sftp(user, pwd, verify=verify_fingerprint)
-    
+
     try:
         remote_path = upload_file(sftp, local_file, '/xfer/wms/in/pdelete')
         return remote_path
@@ -177,29 +177,29 @@ def confirm_delete_upload(delete_file: Path) -> bool:
     print(f"{'='*60}")
     print(f"Delete file: {delete_file.name}")
     print(f"Location:    {delete_file}")
-    
+
     # Show file statistics
     try:
         file_size = delete_file.stat().st_size
-        
+
         # Count records (subtract 1 for header)
         with open(delete_file, 'r', encoding='utf-8') as f:
             record_count = sum(1 for line in f) - 1
-        
+
         print(f"\nFile size:         {file_size:,} bytes")
         print(f"Records to delete: {record_count:,} patrons")
-        
+
     except Exception as e:
         print(f"\nCould not read file details: {e}")
-    
-    print(f"\nDestination: /xfer/wms/in/pdelete/")
+
+    print("\nDestination: /xfer/wms/in/pdelete/")
     print("\nWARNING: This will PERMANENTLY DELETE patron records!")
     print("Please review the file carefully before proceeding.")
-    
+
     # Get user confirmation
     while True:
         response = input("\nType 'yes' to upload, 'no' to cancel: ").strip().lower()
-        
+
         if response == 'yes':
             return True
         elif response == 'no':
@@ -237,13 +237,13 @@ def upload_with_connection(sftp: paramiko.SFTPClient,
             ssh.close()
     """
     uploaded = []
-    
+
     for local_path, remote_dir in files:
         try:
             remote_path = upload_file(sftp, local_path, remote_dir)
             uploaded.append(remote_path)
         except Exception as e:
-            logger.error(f"Failed to upload {local_path}: {e}")
+            logger.error("Failed to upload %s: %s", local_path, e)
             # Continue with other files
-    
+
     return uploaded
