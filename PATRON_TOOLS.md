@@ -6,6 +6,7 @@ Comprehensive guide to patron management scripts for OCLC WMS.
 - [Helper Modules](#helper-modules)
 - [data_fetcher.py - Download Reports](#data_fetcherpy---download-reports)
 - [circ_patron_reload.py - Patron Reloads](#circ_patron_reloadpy---patron-reloads)
+- [build_patron_updates.py - Updates from Exception Reports](#build_patron_updatespy---updates-from-exception-reports)
 - [delete_expired_patrons.py - Delete Expired Patrons](#delete_expired_patronspy---delete-expired-patrons)
 - [idm_blank_patron_tool.py - Blank-Name Patron Review & Delete](#idm_blank_patron_toolpy---blank-name-patron-review--delete)
 - [Required Files](#required-files)
@@ -41,6 +42,7 @@ These utility modules provide shared functionality across all patron tools. You 
 - `extract_first_part_from_pipe_delimited(value, field_name)` - Extracts first segment from pipe-delimited IdM fields
 - `extract_last_part_from_pipe_delimited(value, field_name)` - Extracts last segment from pipe-delimited IdM fields
 - `analyze_pipe_delimited_patterns(df, column_name)` - Analyzes and warns about multi-valued fields
+- `find_latest_patron_report(symbol, search_dirs)` - Finds the newest `ABC.Circulation_Patron_Report_Full.YYYYMMDD.txt/.csv` across several folders (earlier folder wins a date tie)
 
 **Why this matters**: Your OCLC data may contain pipe-delimited values like `old_value|new_value|another_value`. This happens when your Identity Management system has been updated over time and OCLC appended new source values. By default, the scripts extract the **first** value, but you can edit them to extract the **last** (most recent) value instead. See the Advanced Usage section for instructions.
 
@@ -170,8 +172,11 @@ python circ_patron_reload.py <lib_code> [options]
 
 | Flag | Type | Description | Default |
 |------|------|-------------|---------|
-| `--offline` | flag | Use existing file in `patrons/downloads/` (skip download) | Downloads latest file |
+| `--offline` | flag | Skip download; use the newest `ABC.Circulation_Patron_Report_Full.*` found in `patrons/downloads/` **or** `reports/ABC/patrons/` (same date in both: `patrons/downloads/` wins) | Downloads latest file |
+| `--input-file` | path | Use this exact patron report file (implies `--offline`) | Folder search |
 | `--upload` | flag | Upload result to `/xfer/wms/in/patron` | Saves locally only |
+| `--upload-test` | flag | Upload result to TEST directory `/xfer/wms/test/in/patron` | Saves locally only |
+| `--upload-file` | path | Upload an already-built reload file as-is and exit (no download/processing). Production unless `--upload-test` is also given | Off |
 | `--can-self-edit` | choice | Set default `canSelfEdit` value (`true`/`false`) | `false` |
 | `--sync-illid-to-barcode` | flag | Copy updated barcodes to `illId` field (for Tipasa) | Don't sync |
 | `--use-expiration-date` | flag | Apply `EXPIRATION_DATE` from `.env` to all patrons | Leave blank |
@@ -200,16 +205,29 @@ python circ_patron_reload.py wx_abc
 ```
 Looks for `patron_updates.txt` in current directory and applies any updates found.
 
-**Use latest existing file in patrons/downloads for lib_code (combine with other flags as needed to stop new download)**:
+**Use the latest existing file for lib_code (combine with other flags as needed to stop new download)**:
 ```bash
 python circ_patron_reload.py wx_abc --offline
 ```
-Processes existing file in `patrons/downloads/` - useful for testing changes.
+Searches `patrons/downloads/` and `reports/ABC/patrons/` (where `data_fetcher.py --patrons` saves files) and uses the newest-dated `ABC.Circulation_Patron_Report_Full.YYYYMMDD.txt`. If both folders hold the same date, `patrons/downloads/` wins - so put a manually edited copy there to have it take precedence.
 
-**Upload reload file to OCLC (use latest existing file in patrons/downloads for lib_code)**:
+**Use a specific file (e.g., a hand-edited export)**:
+```bash
+python circ_patron_reload.py wx_abc --input-file patrons/downloads/ABC_edited.txt --use-source-value
+```
+No renaming needed; the file is used as-is.
+
+**Upload reload file to OCLC (use latest existing file for lib_code)**:
 ```bash
 python circ_patron_reload.py wx_abc --upload --offline
 ```
+
+**Upload a reload file you already built and reviewed (e.g., trimmed to a few test records)**:
+```bash
+python circ_patron_reload.py wx_abc --upload-file patrons/reloads/ABCpatronreload.txt --upload-test   # TEST
+python circ_patron_reload.py wx_abc --upload-file patrons/reloads/ABCpatronreload.txt                 # PRODUCTION
+```
+Nothing is downloaded or processed; the file is checked for a 46-column header and uploaded as-is.
 
 **Update barcodes and sync to illId (Tipasa libraries)**:
 ```bash
@@ -302,10 +320,11 @@ The script validates new barcodes against OCLC requirements:
 Processed files are saved to:
 ```
 patrons/
-├── downloads/           # Downloaded source files
+├── downloads/           # Source files downloaded by this script (or hand-edited copies)
 └── reloads/
     └── ABCpatronreload.txt  # Generated reload file
 ```
+`--offline` also reads source files from `reports/ABC/patrons/` (downloaded by `data_fetcher.py --patrons`), so you do not need a second copy in `patrons/downloads/`.
 
 ### Troubleshooting
 
@@ -314,7 +333,7 @@ patrons/
 
 **"No matching barcodes found in patron_updates.txt"**:
 - Possibly using the wrong library code or wrong update file
-- Check that barcodes in updates file match the barcodes in patrons/downloads/ABC.* data
+- Check that barcodes in updates file match the barcodes in the patron file that was used (the log lists every candidate and the one chosen)
 - Verify you downloaded the correct library's patron file
 
 **"Column not found: Patron_Barcode"**:
@@ -327,6 +346,78 @@ patrons/
 - Your source system data has multiple values (e.g., `old_id|new_id`)
 - Review the output file before uploading to ensure correct values are used
 - Use `--use-source-value` only after reviewing the log warnings
+
+---
+
+## build_patron_updates.py - Updates from Exception Reports
+
+Turns an OCLC patron-upload **exception report** into a `patron_updates.txt` that reloads only the patrons who failed with:
+
+```
+COMPLETE_CREATE_FAILURE : new username is already used as a username by another user
+```
+
+This error means OCLC already has the patron (matched on username/email) but the incoming barcode differs from the one on the OCLC record. OCLC will only update that record when the load also supplies the system-level match fields `idAtSource` and `sourceSystem`. This script looks each failed username up in your newest full patron report and writes those two values (plus the barcode) into `patron_updates.txt`.
+
+### Basic Usage
+
+```bash
+python build_patron_updates.py <lib_code> [options]
+```
+
+### CLI Flags
+
+| Flag | Type | Description | Default |
+|------|------|-------------|---------|
+| `--exception-file` | path | OCLC exception report to parse | Newest `*exception*.txt` for the symbol in `reports/ABC/stats/` (then `./`, `patrons/`), by the run stamp in the filename |
+| `--patron-file` | path | Full patron report to match against | Newest `ABC.Circulation_Patron_Report_Full.YYYYMMDD.txt` in `reports/ABC/patrons/` |
+| `--output-file` | path | Where to write the updates file | `patron_updates.txt` |
+| `--dry-run` | flag | Print the rows; write nothing | Writes file |
+
+### Workflow
+
+```bash
+# 1. Get the inputs (both saved under reports/ABC/)
+python data_fetcher.py wx_abc --patrons --recent
+python data_fetcher.py wx_abc --stats --recent 2
+
+# 2. Preview, then write patron_updates.txt
+python build_patron_updates.py wx_abc --dry-run
+python build_patron_updates.py wx_abc
+
+# 3. Review patron_updates.txt, then build the reload file for ONLY those patrons
+python circ_patron_reload.py wx_abc --offline --use-source-value
+
+# 4. Review patrons/reloads/ABCpatronreload.txt, then upload
+python circ_patron_reload.py wx_abc --offline --use-source-value --upload-test   # or --upload
+```
+
+### How It Matches
+
+- The line under each failure message is the rejected record echoed back in the 46-column reload layout (tab-delimited, same order as `headers_formattedpatron.txt`). `username` and `barcode` are read from it by column name.
+- The username is compared case-insensitively to `Patron_Username` in the patron report, falling back to `Patron_Email_Address`.
+- `patron_barcode_old` = `Patron_Barcode` from the patron report (the barcode OCLC has on the record now).
+- `patron_barcode_new` = the *incoming* barcode from the exception row (the barcode your load tried to set). If the row cannot be read positionally, the old barcode is kept and a warning is logged.
+- `Patron_User_ID_At_Source` / `Patron_Source_System` are cleaned with the same first-part-of-pipe logic `circ_patron_reload.py --use-source-value` uses, so the values are identical to a normal reload.
+
+### Output
+
+```
+patron_barcode_old	patron_barcode_new	idAtSource	sourceSystem
+w115345	w115100	250fb526-0cd7-40d0-b660-dfabbeef7aa6	urn:mace:oclc:idm:abclibrary
+```
+
+The summary reports how many rows actually change barcode. `circ_patron_reload.py` then runs its usual new-barcode checks (length, duplicates, collisions with barcodes elsewhere in the file, reserved characters) - review those warnings before uploading.
+
+Because `circ_patron_reload.py` does an inner match on `patron_barcode_old`, the resulting reload file contains only these patrons. **Remove or rename `patron_updates.txt` when finished** - a leftover file for the same library silently filters your next reload (a different library's file raises an error and exits).
+
+### Troubleshooting
+
+**"No exception report found"** - run `python data_fetcher.py wx_abc --stats --recent` or pass `--exception-file`.
+
+**"No COMPLETE_CREATE_FAILURE entries found"** - the newest exception file has a different kind of error; pass `--exception-file` for the one you want.
+
+**"N username(s) had no match in the patron report"** - the patron report may be older than the failing load, the username may differ from `Patron_Username`/`Patron_Email_Address`, or the record may exist only in IDM (see `idm_blank_patron_tool.py`).
 
 ---
 
@@ -791,6 +882,8 @@ Both `circ_patron_reload.py` and `delete_expired_patrons.py` support `--offline`
 python circ_patron_reload.py wx_abc --offline
 python delete_expired_patrons.py wx_abc --offline
 ```
+
+`circ_patron_reload.py --offline` looks in both `patrons/downloads/` and `reports/ABC/patrons/` and uses the newest-dated file; on a date tie `patrons/downloads/` wins (so a hand-edited copy saved there overrides the original). Use `--input-file PATH` to name a file explicitly. `delete_expired_patrons.py --offline` still reads only `patrons/downloads/`.
 
 This is useful for:
 - Testing your `patron_updates.txt` without re-downloading

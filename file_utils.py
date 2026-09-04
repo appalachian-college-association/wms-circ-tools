@@ -9,10 +9,63 @@ Used by: circ_patron_reload.py, delete_expired_patrons.py
 """
 
 import logging
+import re
+from datetime import datetime
 from pathlib import Path
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+
+def find_latest_patron_report(symbol: str, search_dirs: list[Path]) -> tuple[Path, list[Path]]:
+    """
+    Find the newest <SYMBOL>.Circulation_Patron_Report_Full.YYYYMMDD.(txt|csv) across search_dirs.
+
+    Args:
+        symbol: Three-letter library symbol (e.g. 'TWY')
+        search_dirs: Directories to scan, in order of precedence. When two
+            candidates share the same file date, the one from the EARLIER
+            directory wins (so callers can let a manually edited copy in
+            patrons/downloads/ override the original in reports/<SYM>/patrons/).
+
+    Returns:
+        Tuple of (chosen file, all candidate files found)
+
+    Raises:
+        FileNotFoundError: If no matching file exists in any of the directories
+    """
+    symbol = symbol.upper()
+    pattern = re.compile(rf"^{symbol}\.Circulation_Patron_Report_Full\.(\d{{8}})\.(txt|csv)$")
+
+    # (file_date, precedence, path) -- precedence is negative dir index so that
+    # max() prefers earlier directories on a date tie
+    candidates = []
+    for rank, d in enumerate(search_dirs):
+        if not d.exists():
+            logger.info("Search directory not found (skipping): %s", d)
+            continue
+        for file_path in d.glob(f"{symbol}.Circulation_Patron_Report_Full.*"):
+            m = pattern.match(file_path.name)
+            if not m:
+                continue
+            try:
+                file_date = datetime.strptime(m.group(1), "%Y%m%d")
+            except ValueError:
+                continue
+            candidates.append((file_date, -rank, file_path))
+
+    if not candidates:
+        searched = ", ".join(str(d) for d in search_dirs)
+        raise FileNotFoundError(
+            f"No {symbol}.Circulation_Patron_Report_Full.YYYYMMDD.txt/.csv found in: {searched}. "
+            f"Run: python data_fetcher.py wx_{symbol.lower()} --patrons"
+        )
+
+    for _, _, p in sorted(candidates, reverse=True):
+        logger.info("  candidate: %s", p)
+
+    _, _, chosen = max(candidates)
+    return chosen, [p for _, _, p in candidates]
 
 
 def safe_read_txt(path: Path) -> pd.DataFrame:
@@ -174,7 +227,10 @@ def analyze_pipe_delimited_patterns(df: pd.DataFrame, column_name: str) -> None:
     if column_name not in df.columns:
         return
     
-    values_with_pipes = df[column_name][df[column_name].astype(str).str.contains('|', na=False)]
+    # regex=False: a bare '|' is regex alternation and would match EVERY value
+    values_with_pipes = df[column_name][
+        df[column_name].astype(str).str.contains('|', regex=False, na=False)
+    ]
     
     if values_with_pipes.empty:
         logger.info(f"{column_name}: No pipe-delimited values found (clean data)")

@@ -19,6 +19,7 @@ These tools are designed for library staff working with WMS circulation data, wi
 - **`data_fetcher.py`** - Download circulation reports and patron files from OCLC SFTP
 - **`data_fetcher_openrefine.py`** - Download circulation reports and patron files from OCLC SFTP with formatting for openrefine loading
 - **`circ_patron_reload.py`** - Build patron reload files with optional updates (barcodes, email, etc.)
+- **`build_patron_updates.py`** - Build `patron_updates.txt` from an OCLC upload exception report (COMPLETE_CREATE_FAILURE / username already used)
 - **`delete_expired_patrons.py`** - Generate delete files for expired patron accounts
 - **`idm_blank_patron_tool.py`** - Review/delete blank-name "ghost" patron records via the OCLC IDM (SCIM) API (not sFTP)
 
@@ -120,15 +121,38 @@ python data_fetcher_openrefine.py wx_abc --recent
 # Create reload file with updates from patron_updates.txt (no upload)
 python circ_patron_reload.py wx_abc
 
-# Use most recent file from patrons/downloads/ABC.*.txt (no upload)
+# Use the most recent ABC.Circulation_Patron_Report_Full.*.txt from patrons/downloads/ or reports/ABC/patrons/ (no upload)
+# Same date in both folders: patrons/downloads/ wins, so save a hand-edited copy there to override the original
+python circ_patron_reload.py wx_abc --offline --use-source-value
+
+# Use a specific file instead of searching (no renaming needed)
 # For a custom file, save as .txt with pipe delimiters and always quote text
 # For an OpenRefine custom tab report from *_Patron_Report_Full*, apply open_refine_option_code.json to format "original" with pipes for patron reload
-# Temporarily rename file in patrons/downloads/ABC.*.txt as ABC.Circulation_Patron_Report_Full.YYYYmmDD.txt (then replace "Full" with "Reload" after completion)
-python circ_patron_reload.py wx_abc --offline --use-source-value
+python circ_patron_reload.py wx_abc --input-file patrons/downloads/ABC_edited.txt --use-source-value
 
 # Upload formatted reload file from patrons/reloads/ABC.*.txt to OCLC 
 # Logs retained in /logs as ABCtypeaction_MMDDYY.log
 python circ_patron_reload.py wx_abc --upload
+
+# Upload a reload file you already built/edited, as-is (add --upload-test for the test directory)
+python circ_patron_reload.py wx_abc --upload-file patrons/reloads/ABCpatronreload.txt
+```
+
+### Fix "username is already used" Load Failures
+```bash
+# Download the newest full patron report and load reports (incl. the .exception file) to reports/ABC/
+python data_fetcher.py wx_abc --patrons --recent
+python data_fetcher.py wx_abc --stats --recent 2
+
+# Build patron_updates.txt for every COMPLETE_CREATE_FAILURE patron:
+#   old barcode = OCLC's current barcode (patron report), new barcode = incoming barcode (exception row),
+#   plus idAtSource + sourceSystem so OCLC can match the existing record
+python build_patron_updates.py wx_abc --dry-run
+python build_patron_updates.py wx_abc
+
+# Reload ONLY those patrons, then review patrons/reloads/ABCpatronreload.txt before uploading
+python circ_patron_reload.py wx_abc --offline --use-source-value
+# Remove patron_updates.txt afterwards so it does not filter your next reload
 ```
 
 ### Delete Expired Patrons
@@ -162,7 +186,7 @@ The scripts automatically organize downloaded and processed files:
 wms-circ-tools/
 ├── patrons/
 │   ├── deletes/                # Generated delete files 
-│   ├── downloads/              # Downloaded patron files
+│   ├── downloads/              # Patron files downloaded by reload/delete scripts, or hand-edited copies
 │   ├── idm_review/             # Generated output from blank patron tool
 │   ├── reloads/                # Generated reload files
 │   └── reports/                # Generated reports from patron scripts
@@ -219,7 +243,7 @@ These tools include multiple safety checks:
 
 **"Column not found" errors**
 - Your downloaded file may have a different structure than expected
-- Check that you're using the correct report type in patrons/downloads (Full patron report)
+- Check that you're using the correct report type (a *Circulation_Patron_Report_Full* file); the log shows which file in patrons/downloads or reports/ABC/patrons was chosen
 - Check that column names match headers_formattedpatron.txt (except patron_barcode_old - required - and patron_barcode_new) and verify/update mapping in circ_patron_reload.py. 
 - See [PATRON_TOOLS.md](PATRON_TOOLS.md) for additional details.
 

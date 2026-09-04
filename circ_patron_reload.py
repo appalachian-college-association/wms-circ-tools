@@ -37,7 +37,7 @@ import paramiko
 from dotenv import load_dotenv
 
 from sftp_utils import get_credentials, connect_sftp, list_remote_files, download_file
-from file_utils import safe_read_txt
+from file_utils import safe_read_txt, find_latest_patron_report
 from data_loader import upload_patron_reload
 from patron_validation import load_patron_updates, preflight_validate_updates
 from patron_filtering import filter_patrons_by_criteria, write_skipped_patrons_report
@@ -220,7 +220,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--offline", action="store_true",
-        help="Skip SFTP download and use existing file in patronloads/downloads",
+        help="Skip SFTP download. Uses the newest <SYM>.Circulation_Patron_Report_Full file found "
+             "in patrons/downloads/ or reports/<SYM>/patrons/ (on a date tie, "
+             "patrons/downloads/ wins so a manually edited copy takes precedence).",
+    )
+    p.add_argument(
+        "--input-file", type=Path, default=None,
+        help="Use this exact patron report file (implies --offline; skips the folder search).",
     )
     p.add_argument("--remote-dir", default="/xfer/wms/reports", help="Remote reports directory")
     p.add_argument(
@@ -230,6 +236,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--upload-test", action="store_true",
         help="If set, upload to TEST directory /xfer/wms/test/in/patron",
+    )
+    p.add_argument(
+        "--upload-file", type=Path, default=None,
+        help="Upload this already-built reload file as-is and exit (no download, no "
+             "processing). Goes to PRODUCTION unless --upload-test is also given.",
     )
     p.add_argument("--output-dir", default="patrons", help="Local base output directory")
     p.add_argument(
@@ -309,47 +320,32 @@ def _setup_logging(symbol: str) -> None:
 
 
 def _find_offline_file(args: argparse.Namespace, downloads_dir: Path) -> Tuple[Path, str]:
-    """Locate the most recent existing patron full file for this library (offline mode)."""
-    logger.info("Offline mode: looking for existing file in downloads directory")
+    """
+    Locate the most recent existing patron full file for this library (offline mode).
 
-    if not downloads_dir.exists():
-        raise FileNotFoundError("Downloads directory does not exist. Run without --offline first.")
-
+    Searches patrons/downloads/ (manually edited copies) and reports/<SYM>/patrons/
+    (data_fetcher.py downloads). Newest file date wins; on a tie the
+    patrons/downloads/ copy is preferred.
+    """
     # Determine the expected symbol from lib_code (e.g. 'wx_acacl' -> 'ACACL')
     parts = args.lib_code.split('_')
     if len(parts) < 2:
         raise ValueError(f"lib_code '{args.lib_code}' should contain underscore (e.g., wx_acacl)")
     expected_symbol = parts[-1].upper()
 
-    logger.info("Looking for files matching symbol: %s", expected_symbol)
+    search_dirs = [downloads_dir, Path("reports") / expected_symbol / "patrons"]
+    logger.info(
+        "Offline mode: looking for %s patron full file in %s",
+        expected_symbol, ", ".join(str(d) for d in search_dirs),
+    )
 
-    # Find the most recent patron file for THIS library
-    patron_files = []
-    for ext in ['.txt', '.csv']:
-        # Pattern now specifically matches the expected symbol
-        pattern = re.compile(
-            rf"^{expected_symbol}\.Circulation_Patron_Report_Full\.(\d{{8}})\{ext}$"
+    txt_local, candidates = find_latest_patron_report(expected_symbol, search_dirs)
+    if len(candidates) > 1:
+        logger.info(
+            "Found %d candidate files; newest wins (patrons/downloads on tie)", len(candidates)
         )
-        for file_path in downloads_dir.glob(
-            f"{expected_symbol}.Circulation_Patron_Report_Full.*{ext}"
-        ):
-            m = pattern.match(file_path.name)
-            if m:
-                try:
-                    file_date = datetime.strptime(m.group(1), "%Y%m%d")
-                    patron_files.append((file_path, file_date, expected_symbol))
-                except ValueError:
-                    continue
-
-    if not patron_files:
-        raise FileNotFoundError(
-            f"No patron files found for {expected_symbol} in downloads directory"
-        )
-
-    # Get the most recent file for this library
-    txt_local, _, symbol = max(patron_files, key=lambda x: x[1])
     logger.info("Using existing file: %s", txt_local)
-    return txt_local, symbol
+    return txt_local, expected_symbol
 
 
 def _download_via_sftp(args: argparse.Namespace, downloads_dir: Path) -> Tuple[Path, str]:
@@ -377,7 +373,13 @@ def _download_via_sftp(args: argparse.Namespace, downloads_dir: Path) -> Tuple[P
 
 
 def _resolve_input_file(args: argparse.Namespace, output_dir: Path) -> Tuple[Path, str]:
-    """Return (local patron file, symbol) from either offline lookup or SFTP download."""
+    """Return (local patron file, symbol) from --input-file, offline lookup, or SFTP download."""
+    if args.input_file is not None:
+        if not args.input_file.exists():
+            raise FileNotFoundError(f"--input-file not found: {args.input_file}")
+        logger.info("Using --input-file: %s", args.input_file)
+        return args.input_file, _symbol_from_lib_code(args.lib_code)
+
     downloads_dir = output_dir / "downloads"
     if args.offline:
         return _find_offline_file(args, downloads_dir)
@@ -551,6 +553,42 @@ def _upload_result(args: argparse.Namespace, out_path: Path) -> None:
     logger.info("Uploaded successfully: %s", remote_path)
 
 
+def _upload_existing_file(args: argparse.Namespace) -> None:
+    """
+    --upload-file mode: sanity-check an already-built reload file and upload it.
+
+    Checks: file exists, is not empty, and its header has the 46 reload columns
+    (so a raw patron report cannot be uploaded by mistake).
+    """
+    reload_file: Path = args.upload_file
+    if not reload_file.exists():
+        logger.error("--upload-file not found: %s", reload_file)
+        sys.exit(1)
+    if reload_file.stat().st_size == 0:
+        logger.error("--upload-file is empty: %s", reload_file)
+        sys.exit(1)
+
+    expected_headers = load_headers(Path(args.headers_file))
+    with reload_file.open("r", encoding="utf-8") as fh:
+        header = [h.strip() for h in fh.readline().rstrip("\r\n").split("\t")]
+        row_count = sum(1 for line in fh if line.strip())
+
+    if header != expected_headers:
+        logger.error(
+            "--upload-file header does not match %s (%d columns found, %d expected). "
+            "Is this a formatted reload file?",
+            args.headers_file, len(header), len(expected_headers),
+        )
+        sys.exit(1)
+
+    logger.info("Uploading existing reload file as-is: %s (rows: %d)", reload_file, row_count)
+
+    # --upload-file implies --upload unless the caller chose the TEST directory
+    if not args.upload_test:
+        args.upload = True
+    _upload_result(args, reload_file)
+
+
 def main(argv=None):
     """Entry point: download/locate the patron file, apply updates, and write the reload file."""
     args = build_arg_parser().parse_args(argv)
@@ -563,6 +601,10 @@ def main(argv=None):
     logger.info("=" * 60)
     logger.info("Library code: %s", args.lib_code)
     logger.info("Symbol: %s", symbol)
+
+    if args.upload_file is not None:
+        _upload_existing_file(args)
+        return
 
     # Resolve paths and locate the input file
     output_dir = Path(args.output_dir)
