@@ -1,0 +1,240 @@
+[
+  {
+    "op": "core/column-addition",
+    "engineConfig": {
+      "facets": [],
+      "mode": "row-based"
+    },
+    "baseColumnName": "Patron_User_ID_At_Source",
+    "expression": "grel:value",
+    "onError": "set-to-blank",
+    "newColumnName": "originalIDatSource",
+    "columnInsertIndex": 33,
+    "description": "Create column originalIDatSource at index 33 based on column Patron_User_ID_At_Source using expression grel:value"
+  },
+  {
+    "op": "core/column-addition",
+    "engineConfig": {
+      "facets": [],
+      "mode": "row-based"
+    },
+    "baseColumnName": "Patron_Source_System",
+    "expression": "grel:value",
+    "onError": "set-to-blank",
+    "newColumnName": "originalSourceSystem",
+    "columnInsertIndex": 34,
+    "description": "Create column originalSourceSystem at index 34 based on column Patron_Source_System using expression grel:value"
+  },
+  {
+    "op": "core/column-addition",
+    "engineConfig": {
+      "facets": [
+        {
+          "type": "text",
+          "name": "Patron_Barcode",
+          "columnName": "Patron_Barcode",
+          "query": "",
+          "mode": "text",
+          "caseSensitive": false,
+          "invert": false
+        }
+      ],
+      "mode": "row-based"
+    },
+    "baseColumnName": "Patron_Barcode",
+    "expression": "grel:if(isBlank(cell.cross('WVBpatronsdelete110325','barcode').cells['verify-status'].value),'active',cell.cross('WVBpatronsdelete110325','barcode').cells['verify-status'].value[0])",
+    "onError": "set-to-blank",
+    "newColumnName": "status",
+    "columnInsertIndex": 6,
+    "description": "Create column status at index 6 based on column Patron_Barcode using expression grel:if(isBlank(cell.cross('WVBpatronsdelete110325','barcode').cells['verify-status'].value),'active',cell.cross('WVBpatronsdelete110325','barcode').cells['verify-status'].value[0])"
+  },
+  {
+    "op": "core/text-transform",
+    "engineConfig": {
+      "facets": [
+        {
+          "type": "list",
+          "name": "status",
+          "expression": "value",
+          "columnName": "status",
+          "invert": false,
+          "omitBlank": false,
+          "omitError": false,
+          "selection": [
+            {
+              "v": {
+                "v": "active",
+                "l": "active"
+              }
+            }
+          ],
+          "selectBlank": false,
+          "selectError": false
+        }
+      ],
+      "mode": "row-based"
+    },
+    "columnName": "status",
+    "expression": "grel:if(cells['Patron_Expiration_Date'].value.toDate() < now(),'expired',value)",
+    "onError": "keep-original",
+    "repeat": false,
+    "repeatCount": 10,
+    "description": "Text transform on cells in column status using expression grel:if(cells['Patron_Expiration_Date'].value.toDate() < now(),'expired',value)"
+  },
+  {
+    "op": "core/text-transform",
+    "engineConfig": {
+      "facets": [],
+      "mode": "row-based"
+    },
+    "columnName": "status",
+    "expression": "grel:if(or(contains(cells['Patron_Borrower_Category'].value, \"Faculty/Staff\"), contains(cells['Patron_Borrower_Category'].value, \"Student\")), value, \"excluded_category\")",
+    "onError": "keep-original",
+    "repeat": false,
+    "repeatCount": 10,
+    "description": "Text transform on cells in column status using expression grel:if(or(contains(cells['Patron_Borrower_Category'].value, \"Faculty/Staff\"), contains(cells['Patron_Borrower_Category'].value, \"Student\")), value, \"excluded_category\")"
+  },
+  {
+    "op": "core/text-transform",
+    "engineConfig": {
+      "facets": [],
+      "mode": "row-based"
+    },
+    "columnName": "status",
+    "expression": "grel:if(isNonBlank(cells['User_Account_Roles'].value),\nvalue + \" - WMS_roles\",value)",
+    "onError": "keep-original",
+    "repeat": false,
+    "repeatCount": 10,
+    "description": "Text transform on cells in column status using expression grel:if(isNonBlank(cells['User_Account_Roles'].value),\nvalue + \" - WMS_roles\",value)"
+  },
+  {
+    "op": "core/text-transform",
+    "engineConfig": {
+      "facets": [],
+      "mode": "row-based"
+    },
+    "columnName": "status",
+    "expression": "grel:if(\n  toString(value) != \"active\",\n  value,\n  if(\n    and(\n      toString(cells['Patron_User_ID_At_Source'].value).toLowercase().contains(\"@bethanywv.edu\"),\n      toString(cells['Patron_Source_System'].value).contains(\"https://sts.windows.net/e7f0b6cf-3723-46f1-a1ea-e81e6753374d/\")\n    ),\n    value + \" - verified\",\n    value + \" - review_source\"\n  )\n)",
+    "onError": "keep-original",
+    "repeat": false,
+    "repeatCount": 10,
+    "description": "Text transform on cells in column status using expression grel:if(\n  toString(value) != \"active\",\n  value,\n  if(\n    and(\n      toString(cells['Patron_User_ID_At_Source'].value).toLowercase().contains(\"@bethanywv.edu\"),\n      toString(cells['Patron_Source_System'].value).contains(\"https://sts.windows.net/e7f0b6cf-3723-46f1-a1ea-e81e6753374d/\")\n    ),\n    value + \" - verified\",\n    value + \" - review_source\"\n  )\n)"
+  },
+  {
+    "op": "core/text-transform",
+    "engineConfig": {
+      "facets": [],
+      "mode": "row-based"
+    },
+    "columnName": "status",
+    "expression": "grel:if(\n  toString(value) != \"active - review_source\",\n  value,\n  if(\n      toString(cells['Patron_Email_Address'].value).contains(/^[^ \\@\\,\\;]+@bethanywv.edu$/),\n    \"reload - source_from_patron_email\",\n    value\n  )\n)",
+    "onError": "keep-original",
+    "repeat": false,
+    "repeatCount": 10,
+    "description": "Text transform on cells in column status using expression grel:if(\n  toString(value) != \"active - review_source\",\n  value,\n  if(\n      toString(cells['Patron_Email_Address'].value).contains(/^[^ \\@\\,\\;]+@bethanywv.edu$/),\n    \"reload - source_from_patron_email\",\n    value\n  )\n)"
+  },
+  {
+    "op": "core/text-transform",
+    "engineConfig": {
+      "facets": [],
+      "mode": "row-based"
+    },
+    "columnName": "status",
+    "expression": "grel:if(\n  toString(value) != \"active - review_source\",\n  value,\n  if(\n      toString(cells['Patron_Username'].value).contains(/^[^ \\@\\,\\;]+@bethanywv.edu$/),\n    \"reload - source_from_patron_username\",\n    \"failed to reload - no bethanywv.edu address\"\n  )\n)",
+    "onError": "keep-original",
+    "repeat": false,
+    "repeatCount": 10,
+    "description": "Text transform on cells in column status using expression grel:if(\n  toString(value) != \"active - review_source\",\n  value,\n  if(\n      toString(cells['Patron_Username'].value).contains(/^[^ \\@\\,\\;]+@bethanywv.edu$/),\n    \"reload - source_from_patron_username\",\n    \"failed to reload - no bethanywv.edu address\"\n  )\n)"
+  },
+  {
+    "op": "core/text-transform",
+    "engineConfig": {
+      "facets": [],
+      "mode": "row-based"
+    },
+    "columnName": "Patron_Source_System",
+    "expression": "grel:if(\n  toString(cells['status'].value).contains(/^reload.+/),\n\"https://sts.windows.net/e7f0b6cf-3723-46f1-a1ea-e81e6753374d/\",\nvalue)",
+    "onError": "keep-original",
+    "repeat": false,
+    "repeatCount": 10,
+    "description": "Text transform on cells in column Patron_Source_System using expression grel:if(\n  toString(cells['status'].value).contains(/^reload.+/),\n\"https://sts.windows.net/e7f0b6cf-3723-46f1-a1ea-e81e6753374d/\",\nvalue)"
+  },
+  {
+    "op": "core/text-transform",
+    "engineConfig": {
+      "facets": [],
+      "mode": "row-based"
+    },
+    "columnName": "Patron_User_ID_At_Source",
+    "expression": "grel:if(\n  toString(cells['status'].value) == \"reload - source_from_patron_email\",\ncells['Patron_Email_Address'].value.trim().toLowercase(),\nvalue)",
+    "onError": "keep-original",
+    "repeat": false,
+    "repeatCount": 10,
+    "description": "Text transform on cells in column Patron_User_ID_At_Source using expression grel:if(\n  toString(cells['status'].value) == \"reload - source_from_patron_email\",\ncells['Patron_Email_Address'].value.trim().toLowercase(),\nvalue)"
+  },
+  {
+    "op": "core/text-transform",
+    "engineConfig": {
+      "facets": [],
+      "mode": "row-based"
+    },
+    "columnName": "Patron_User_ID_At_Source",
+    "expression": "grel:if(\n  toString(cells['status'].value) == \"reload - source_from_patron_username\",\ncells['Patron_Username'].value.trim().toLowercase(),\nvalue)",
+    "onError": "keep-original",
+    "repeat": false,
+    "repeatCount": 10,
+    "description": "Text transform on cells in column Patron_User_ID_At_Source using expression grel:if(\n  toString(cells['status'].value) == \"reload - source_from_patron_username\",\ncells['Patron_Username'].value.trim().toLowercase(),\nvalue)"
+  },
+  {
+    "op": "core/column-addition",
+    "engineConfig": {
+      "facets": [],
+      "mode": "row-based"
+    },
+    "baseColumnName": "Patron_Barcode",
+    "expression": "grel:if(cells['status'].value.contains(/^reload/),value,'')",
+    "onError": "set-to-blank",
+    "newColumnName": "patron_barcode_new",
+    "columnInsertIndex": 6,
+    "description": "Create column patron_barcode_new at index 6 based on column Patron_Barcode using expression grel:if(cells['status'].value.contains(/^reload/),value,'')"
+  },
+  {
+    "op": "core/column-addition",
+    "engineConfig": {
+      "facets": [],
+      "mode": "row-based"
+    },
+    "baseColumnName": "Patron_Barcode",
+    "expression": "grel:if(cells['status'].value.contains(/^reload/),value,'')",
+    "onError": "set-to-blank",
+    "newColumnName": "patron_barcode_old",
+    "columnInsertIndex": 6,
+    "description": "Create column patron_barcode_old at index 6 based on column Patron_Barcode using expression grel:if(cells['status'].value.contains(/^reload/),value,'')"
+  },
+  {
+    "op": "core/column-addition",
+    "engineConfig": {
+      "facets": [],
+      "mode": "row-based"
+    },
+    "baseColumnName": "patron_barcode_new",
+    "expression": "grel:if(cells['status'].value.contains(/^reload/),cells['Patron_User_ID_At_Source'].value,'')",
+    "onError": "set-to-blank",
+    "newColumnName": "idAtSource",
+    "columnInsertIndex": 8,
+    "description": "Create column idAtSource at index 8 based on column patron_barcode_new using expression grel:if(cells['status'].value.contains(/^reload/),cells['Patron_User_ID_At_Source'].value,'')"
+  },
+  {
+    "op": "core/column-addition",
+    "engineConfig": {
+      "facets": [],
+      "mode": "row-based"
+    },
+    "baseColumnName": "idAtSource",
+    "expression": "grel:if(cells['status'].value.contains(/^reload/),'https://sts.windows.net/e7f0b6cf-3723-46f1-a1ea-e81e6753374d/','')",
+    "onError": "set-to-blank",
+    "newColumnName": "sourceSystem",
+    "columnInsertIndex": 9,
+    "description": "Create column sourceSystem at index 9 based on column idAtSource using expression grel:if(cells['status'].value.contains(/^reload/),'https://sts.windows.net/e7f0b6cf-3723-46f1-a1ea-e81e6753374d/','')"
+  }
+]

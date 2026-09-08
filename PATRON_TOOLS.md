@@ -7,6 +7,7 @@ Comprehensive guide to patron management scripts for OCLC WMS.
 - [data_fetcher.py - Download Reports](#data_fetcherpy---download-reports)
 - [circ_patron_reload.py - Patron Reloads](#circ_patron_reloadpy---patron-reloads)
 - [build_patron_updates.py - Updates from Exception Reports](#build_patron_updatespy---updates-from-exception-reports)
+- [check_source.py - Campus Source Values](#check_sourcepy---campus-source-values)
 - [delete_expired_patrons.py - Delete Expired Patrons](#delete_expired_patronspy---delete-expired-patrons)
 - [idm_blank_patron_tool.py - Blank-Name Patron Review & Delete](#idm_blank_patron_toolpy---blank-name-patron-review--delete)
 - [Required Files](#required-files)
@@ -218,7 +219,7 @@ python circ_patron_reload.py wx_abc --input-file patrons/downloads/ABC_edited.tx
 No renaming needed; the file is used as-is. For a custom input file:
 - Keep the original OCLC column names (`Patron_Barcode`, `Patron_Username`, etc.); the delimiter (pipe, tab, or comma) is auto-detected from the header line.
 - If you save from Excel/OpenRefine, use pipe delimiters and quote all text so embedded commas do not shift columns.
-- For an OpenRefine export of a `*_Patron_Report_Full*` report, apply `patrons/open_refine_option_code_reload_format.json` to restore the "original" pipe-delimited layout before using it here.
+- For an OpenRefine export of a `*_Patron_Report_Full*` report, apply `openrefine/open_refine_option_code_reload_format.json` to restore the "original" pipe-delimited layout before using it here (see `openrefine/README.md`).
 
 **Upload reload file to OCLC (use latest existing file for lib_code)**:
 ```bash
@@ -422,6 +423,95 @@ Because `circ_patron_reload.py` does an inner match on `patron_barcode_old`, the
 **"No COMPLETE_CREATE_FAILURE entries found"** - the newest exception file has a different kind of error; pass `--exception-file` for the one you want.
 
 **"N username(s) had no match in the patron report"** - the patron report may be older than the failing load, the username may differ from `Patron_Username`/`Patron_Email_Address`, or the record may exist only in IDM (see `idm_blank_patron_tool.py`).
+
+---
+
+## check_source.py - Campus Source Values
+
+Finds active patrons whose OCLC record lacks the **campus** IdM source pair and builds a `patron_updates.txt` that adds it. Patrons that cannot be fixed automatically go to a review file.
+
+**Background**: Libraries whose patrons sign in through a campus identity provider (WVB: Bethany College's Azure AD tenant) need each OCLC record to carry `idAtSource` = campus email and `sourceSystem` = the provider's identifier (`https://sts.windows.net/<tenant>/`). OCLC never deletes old source values, so `Patron_User_ID_At_Source` and `Patron_Source_System` are pipe-delimited lists that also hold OCLC IDM GUIDs, `urn:mace:oclc:idm:...` entries, and `barcode.update` junk. A record is fine as long as one campus pair exists **at the same position** in both lists.
+
+This script replaces the OpenRefine history in `openrefine/WVBpatron_check_source.json`.
+
+### Configuration
+
+Per library symbol, in `.env`:
+```env
+WVB_CAMPUS_DOMAIN=bethanywv.edu
+WVB_CAMPUS_SOURCE_SYSTEM=https://sts.windows.net/e7f0b6cf-3723-46f1-a1ea-e81e6753374d/
+```
+`--domain` / `--source-system` on the command line override these.
+
+### Basic Usage
+
+```bash
+python check_source.py <lib_code> [options]
+```
+
+### CLI Flags
+
+| Flag | Type | Description | Default |
+|------|------|-------------|---------|
+| `--domain` | text | Campus email domain | `<SYM>_CAMPUS_DOMAIN` from `.env` |
+| `--source-system` | text | Campus sourceSystem value | `<SYM>_CAMPUS_SOURCE_SYSTEM` from `.env` |
+| `--exclude-email` | text, repeatable | Address that is never a valid idAtSource | `library@<domain>` |
+| `--include-category` | text, repeatable | Borrower-category substring to include | `Faculty/Staff`, `Student` |
+| `--patron-file` | path | Full patron report to read | Newest `ABC.Circulation_Patron_Report_Full.*` in `patrons/downloads/` or `reports/ABC/patrons/` (same rule as `circ_patron_reload.py --offline`) |
+| `--output-file` | path | Where to write the updates file | `patron_updates.txt` |
+| `--review-dir` | path | Where to write the review file | `patrons/reports/` |
+| `--dry-run` | flag | Print previews and counts; write nothing | Writes files |
+
+### Workflow
+
+```bash
+python data_fetcher.py wx_abc --patrons --recent      # newest full patron report -> reports/ABC/patrons/
+python check_source.py wx_abc --dry-run               # preview counts
+python check_source.py wx_abc                         # writes patron_updates.txt + patrons/reports/ABC_source_review_YYYYMMDD.txt
+python circ_patron_reload.py wx_abc --offline         # reload ONLY the patrons in patron_updates.txt
+# review patrons/reloads/ABCpatronreload.txt, then
+python circ_patron_reload.py wx_abc --upload-file patrons/reloads/ABCpatronreload.txt
+```
+`--use-source-value` is not needed on the reload: idAtSource/sourceSystem come from `patron_updates.txt`. Remove `patron_updates.txt` when done.
+
+### How Patrons Are Classified
+
+Each patron gets exactly one status, checked in this order:
+
+| Status | Rule | Goes to |
+|--------|------|---------|
+| `expired` | `Patron_Expiration_Date` before today | log count only |
+| `excluded_category` | `Patron_Borrower_Category` contains none of the include list | log count only |
+| `wms_roles` | `User_Account_Roles` is not blank (staff accounts) | review file |
+| `verified` | a campus email and the campus sourceSystem sit at the same position in the two source lists | skipped (already correct) |
+| `reload_from_email` | `Patron_Email_Address` is exactly one campus address | `patron_updates.txt` |
+| `reload_from_username` | else `Patron_Username` is exactly one campus address | `patron_updates.txt` |
+| `review_excluded_email` | the only campus address is an excluded one (e.g. `library@...`) | review file |
+| `review_no_campus_email` | no campus address in email or username | review file |
+| `review_shared_email` | two or more reload candidates share the same email (cannot be a unique idAtSource) | review file |
+
+"Exactly one campus address" means the whole field matches `^[^\s@,;]+@<domain>$` (same rule as the OpenRefine recipe). If a record's two source lists have different lengths the positional check is impossible; the script then accepts "both lists contain a match" and logs how many records it treated that way.
+
+### Output Files
+
+**`patron_updates.txt`** (tab-delimited, project root):
+```
+patron_barcode_old	patron_barcode_new	idAtSource	sourceSystem
+0038768	0038768	jforsty@bethanywv.edu	https://sts.windows.net/e7f0b6cf-3723-46f1-a1ea-e81e6753374d/
+```
+The barcode is unchanged; only the source fields are added.
+
+**`patrons/reports/ABC_source_review_YYYYMMDD.txt`** (tab-delimited): `barcode, familyName, givenName, borrowerCategory, expirationDate, email, username, current_idAtSource, current_sourceSystem, reason`. Share this with the library to collect campus addresses for the `review_*` rows; the `wms_roles` rows are listed so staff accounts are not silently skipped.
+
+### Troubleshooting
+
+**"Campus source settings not found for ABC"** - add `ABC_CAMPUS_DOMAIN` and `ABC_CAMPUS_SOURCE_SYSTEM` to `.env`, or pass `--domain` and `--source-system`.
+
+**"No ABC.Circulation_Patron_Report_Full... found"** - run `python data_fetcher.py wx_abc --patrons --recent` or pass `--patron-file`.
+
+**Many patrons land in `excluded_category`** - check the exact category names in the report (`Patron_Borrower_Category`) and pass `--include-category` for each one you want.
+
+**A patron you expected to reload shows `verified`** - the record already has a campus pair somewhere in its lists; check `current_idAtSource`/`current_sourceSystem` in the report. Only records with **no** campus pair are reloaded.
 
 ---
 

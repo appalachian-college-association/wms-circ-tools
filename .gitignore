@@ -38,3 +38,7 @@ lookup.txt
 .coverage
 htmlcov/
 
+
+# --- Tracked OpenRefine specs (exception to *.json above) ---
+!openrefine/
+!openrefine/*.json

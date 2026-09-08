@@ -20,6 +20,7 @@ These tools are designed for library staff working with WMS circulation data, wi
 - **`data_fetcher_openrefine.py`** - Download circulation reports and patron files from OCLC SFTP with formatting for openrefine loading
 - **`circ_patron_reload.py`** - Build patron reload files with optional updates (barcodes, email, etc.)
 - **`build_patron_updates.py`** - Build `patron_updates.txt` from an OCLC upload exception report (COMPLETE_CREATE_FAILURE / username already used)
+- **`check_source.py`** - Find patrons missing campus idAtSource/sourceSystem values; build `patron_updates.txt` for them and a review file for the rest
 - **`delete_expired_patrons.py`** - Generate delete files for expired patron accounts
 - **`idm_blank_patron_tool.py`** - Review/delete blank-name "ghost" patron records via the OCLC IDM (SCIM) API (not sFTP)
 
@@ -154,6 +155,21 @@ python circ_patron_reload.py wx_abc --offline --use-source-value
 # Remove patron_updates.txt afterwards so it does not filter your next reload
 ```
 
+### Add Campus Source Values (idAtSource / sourceSystem)
+```bash
+# Needs ABC_CAMPUS_DOMAIN and ABC_CAMPUS_SOURCE_SYSTEM in .env (see sample.env)
+python data_fetcher.py wx_abc --patrons --recent
+
+# Preview, then write patron_updates.txt (patrons missing the campus pair)
+# and patrons/reports/ABC_source_review_YYYYMMDD.txt (patrons needing a campus email from the library)
+python check_source.py wx_abc --dry-run
+python check_source.py wx_abc
+
+# Reload ONLY those patrons; review patrons/reloads/ABCpatronreload.txt before uploading
+python circ_patron_reload.py wx_abc --offline
+python circ_patron_reload.py wx_abc --upload-file patrons/reloads/ABCpatronreload.txt
+```
+
 ### Delete Expired Patrons
 ```bash
 # Generate delete file for patrons expired before today (no upload)
@@ -188,7 +204,8 @@ wms-circ-tools/
 │   ├── downloads/              # Patron files downloaded by reload/delete scripts, or hand-edited copies
 │   ├── idm_review/             # Generated output from blank patron tool
 │   ├── reloads/                # Generated reload files
-│   └── reports/                # Generated reports from patron scripts
+│   └── reports/                # Generated reports from patron scripts (skipped-patron and source-review files)
+├── openrefine/                 # OpenRefine histories / export option codes (reference specs, tracked)
 ├── reports/
 │   └── ABC/                    # Per-library folders
 │       ├── items/              # Item inventory reports
