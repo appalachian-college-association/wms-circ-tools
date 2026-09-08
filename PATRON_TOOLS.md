@@ -215,7 +215,10 @@ Searches `patrons/downloads/` and `reports/ABC/patrons/` (where `data_fetcher.py
 ```bash
 python circ_patron_reload.py wx_abc --input-file patrons/downloads/ABC_edited.txt --use-source-value
 ```
-No renaming needed; the file is used as-is.
+No renaming needed; the file is used as-is. For a custom input file:
+- Keep the original OCLC column names (`Patron_Barcode`, `Patron_Username`, etc.); the delimiter (pipe, tab, or comma) is auto-detected from the header line.
+- If you save from Excel/OpenRefine, use pipe delimiters and quote all text so embedded commas do not shift columns.
+- For an OpenRefine export of a `*_Patron_Report_Full*` report, apply `patrons/open_refine_option_code_reload_format.json` to restore the "original" pipe-delimited layout before using it here.
 
 **Upload reload file to OCLC (use latest existing file for lib_code)**:
 ```bash
@@ -335,6 +338,7 @@ patrons/
 - Possibly using the wrong library code or wrong update file
 - Check that barcodes in updates file match the barcodes in the patron file that was used (the log lists every candidate and the one chosen)
 - Verify you downloaded the correct library's patron file
+- Check for extra whitespace around barcodes (the script trims automatically and logs how many values it trimmed)
 
 **"Column not found: Patron_Barcode"**:
 - Your downloaded file doesn't have the expected structure
