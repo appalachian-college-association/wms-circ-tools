@@ -135,6 +135,7 @@ python circ_patron_reload.py wx_abc --input-file patrons/downloads/ABC_edited.tx
 python circ_patron_reload.py wx_abc --upload
 
 # Upload a reload file you already built/edited, as-is (add --upload-test for the test directory)
+# Processing flags (--use-source-value, --filter-email-domain, etc.) are ignored here; the file is sent unchanged
 python circ_patron_reload.py wx_abc --upload-file patrons/reloads/ABCpatronreload.txt
 ```
 

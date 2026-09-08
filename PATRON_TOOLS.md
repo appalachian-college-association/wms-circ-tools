@@ -227,7 +227,7 @@ python circ_patron_reload.py wx_abc --upload --offline
 python circ_patron_reload.py wx_abc --upload-file patrons/reloads/ABCpatronreload.txt --upload-test   # TEST
 python circ_patron_reload.py wx_abc --upload-file patrons/reloads/ABCpatronreload.txt                 # PRODUCTION
 ```
-Nothing is downloaded or processed; the file is checked for a 46-column header and uploaded as-is.
+Nothing is downloaded or processed; the file is checked for a 46-column header and uploaded as-is. Processing flags such as `--use-source-value`, `--filter-email-domain`, or `--use-expiration-date` have no effect in this mode - whatever values are already in the file are what OCLC receives.
 
 **Update barcodes and sync to illId (Tipasa libraries)**:
 ```bash
