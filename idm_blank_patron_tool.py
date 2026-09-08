@@ -46,16 +46,46 @@ delete_expired_patrons.py elsewhere in this repo):
     for each one, including a "blank_name" Yes/No column. Nothing is
     deleted in this step.
 
+  STEP 1b -- REVIEW FROM AN EXCEPTION REPORT (read-only):
+      python idm_blank_patron_tool.py wx_wvb \
+          --review-exception reports/WVB/stats/WVB.[...].exception.[...].txt
+
+    For every failed record in an OCLC load exception report (e.g. the
+    DUPLICATE_BARCODE_ERROR rows caused by "ghost" IDM records that carry the
+    patron's campus email as User ID at Source but nothing else), this looks
+    up the idAtSource email with BOTH API filters, writes one CSV row per
+    record found, and pre-flags delete_candidate = Yes when the record has a
+    blank name, or a name that differs from the exception row AND no barcode.
+    A record that carries a barcode is treated as the real patron and is never
+    pre-flagged. You still type YES in confirm_delete before anything is deleted.
+
+    LIMITATION (confirmed against WVB's WSKey on 2026-09-08): the SCIM search
+    filters only reach records by BARCODE (External_ID) or EMAIL_ADDRESS. A
+    ghost has neither, so search returns only the real patron. Ghosts can be
+    fetched ONLY by their PPID (GET /Users/{id}), and no OCLC report gives us
+    that PPID. The review still confirms the pattern (each email -> one real
+    record with the expected barcode) and writes a worklist,
+    patrons/idm_review/<SYM>_ppid_needed_<timestamp>.tsv, of every email whose
+    ghost was not found.
+
+    RECOMMENDED: work down that list in WMS Admin - search "Name, ID, Email"
+    for the email, open the "Not supplied" record, and click Delete account.
+
+    OPTIONAL batch path: paste each ghost's PPID (WMS diagnostics ->
+    Namespace/PPID) into the ppid column and re-run with
+          --ppid-file patrons/idm_review/WVB_ppid_needed_[...].tsv
+    so the ghosts are fetched directly, flagged, and deletable via --delete.
+
   STEP 2 -- DELETE (destructive, requires your manual sign-off twice):
       python idm_blank_patron_tool.py wx_wvb --delete patrons/idm_review/WVB_idm_review_[...].csv
 
     Open the review CSV from Step 1 in Excel. For each row where
-    blank_name = Yes that you've confirmed you want removed, type YES
-    (all capitals) into the confirm_delete column. Save the file, then run
-    this step. The script will ONLY delete rows where BOTH
-    blank_name = Yes AND confirm_delete = YES, and it will show you the
-    exact list and ask you to type "yes" one more time before doing
-    anything irreversible.
+    blank_name = Yes (or delete_candidate = Yes) that you've confirmed you
+    want removed, type YES (all capitals) into the confirm_delete column.
+    Save the file, then run this step. The script will ONLY delete rows where
+    confirm_delete = YES AND (blank_name = Yes OR delete_candidate = Yes), and
+    it will show you the exact list and ask you to type "yes" one more time
+    before doing anything irreversible.
 
 .env FILE REQUIREMENTS (add these -- separate from your SFTP credentials):
     WVB_IDM_CLIENT_ID=your-wskey-client-id
@@ -90,6 +120,8 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
+from exception_report import parse_exception_report, count_by_type
+
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -106,7 +138,15 @@ REVIEW_FIELDNAMES = [
     "institution_id", "given_name", "family_name", "oclc_username",
     "source_system", "id_at_source", "created", "last_modified",
     "blank_name", "confirm_delete", "notes",
+    # Added for --review-exception (blank for plain --review rows)
+    "barcode", "emails", "expected_given_name", "expected_family_name",
+    "expected_barcode", "name_matches", "has_campus_correlation", "delete_candidate",
 ]
+
+# SCIM schema extensions OCLC uses on a user record
+_PERSONA_EXT = "urn:mace:oclc.org:eidm:schema:persona:persona:20180305"
+_CORRELATION_EXT = "urn:mace:oclc.org:eidm:schema:persona:correlationinfo:20180101"
+_CIRC_EXT = "urn:mace:oclc.org:eidm:schema:persona:wmscircpatroninfo:20180101"
 
 # Matches a principal ID / PPID, e.g. 960b0082-f927-4ce8-89e1-e16867b4a4b1
 # PPID is searchable directly in WMS Admin with User ID at Source index
@@ -320,20 +360,102 @@ def search_user(access_token: str, registry_id: str, value: str) -> dict:
     return result
 
 
+def search_all_matches(access_token: str, registry_id: str, value: str) -> list:
+    """
+    Like search_user(), but runs BOTH filters (External_ID, then EMAIL_ADDRESS)
+    and returns EVERY record found, de-duplicated by principal ID.
+
+    Used by --review-exception, where one email can legitimately point at two
+    records (the ghost that carries it as idAtSource and the real patron that
+    carries it as a home email) and we need to judge each of them. Each
+    returned record gets a "_found_via" key listing the filters that hit it.
+    """
+    url = f"https://{registry_id}.share.worldcat.org/idaas/scim/v2/Users/.search"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/scim+json",
+    }
+    attempts = [
+        ("external_id", f'External_ID eq "{value}"'),
+        ("email", f'EMAIL_ADDRESS eq "{value}"'),
+    ]
+
+    found = {}
+    for label, filter_str in attempts:
+        body = {
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:SearchRequest"],
+            "filter": filter_str,
+        }
+        resp = requests.post(url, headers=headers, json=body, timeout=30)
+        time.sleep(RATE_LIMIT_DELAY)
+
+        if resp.status_code != 200:
+            logger.warning(
+                "Search failed for '%s' as %s (status %s): %s",
+                value, label, resp.status_code, resp.text[:200],
+            )
+            continue
+
+        for user in resp.json().get("Resources", []) or []:
+            pid = user.get("id", "")
+            if pid in found:
+                found[pid]["_found_via"].append(label)
+            else:
+                user["_found_via"] = [label]
+                found[pid] = user
+
+    return list(found.values())
+
+
+def _find_key(obj, key: str) -> str:
+    """Depth-first search of nested dicts/lists for the first non-empty value of *key*."""
+    if isinstance(obj, dict):
+        if obj.get(key):
+            return str(obj[key]).strip()
+        for v in obj.values():
+            hit = _find_key(v, key)
+            if hit:
+                return hit
+    elif isinstance(obj, list):
+        for item in obj:
+            hit = _find_key(item, key)
+            if hit:
+                return hit
+    return ""
+
+
+def _extract_barcode(user: dict) -> str:
+    """
+    Best-effort barcode from a SCIM record. OCLC's spec is not explicit about
+    where it lives, so check the likely places, then fall back to any
+    "barcode" key anywhere in the payload.
+    """
+    persona = user.get(_PERSONA_EXT) or {}
+    if persona.get("barcode"):
+        return str(persona["barcode"]).strip()
+    circ = user.get(_CIRC_EXT) or {}
+    info = circ.get("circulationInfo") or {}
+    if isinstance(info, dict) and info.get("barcode"):
+        return str(info["barcode"]).strip()
+    return _find_key({k: v for k, v in user.items() if k != "_found_via"}, "barcode")
+
+
 def extract_user_fields(user: dict) -> dict:
     """Pull the fields we care about out of a raw SCIM user record."""
     name = user.get("name", {}) or {}
     given = (name.get("givenName") or "").strip()
     family = (name.get("familyName") or "").strip()
 
-    persona = user.get("urn:mace:oclc.org:eidm:schema:persona:persona:20180305", {}) or {}
-    correlation = user.get(
-        "urn:mace:oclc.org:eidm:schema:persona:correlationinfo:20180101", {}
-        ) or {}
+    persona = user.get(_PERSONA_EXT, {}) or {}
+    correlation = user.get(_CORRELATION_EXT, {}) or {}
     corr_list = correlation.get("correlationInfo", []) or []
-    source_system = corr_list[0].get("sourceSystem", "") if corr_list else ""
-    id_at_source = corr_list[0].get("idAtSource", "") if corr_list else ""
+    # ALL correlation pairs, pipe-joined in matching order (OCLC keeps old ones)
+    source_system = "|".join((c.get("sourceSystem") or "").strip() for c in corr_list)
+    id_at_source = "|".join((c.get("idAtSource") or "").strip() for c in corr_list)
 
+    emails = "|".join(
+        (e.get("value") or "").strip() for e in (user.get("emails") or []) if isinstance(e, dict)
+    )
     meta = user.get("meta", {}) or {}
 
     return {
@@ -347,6 +469,8 @@ def extract_user_fields(user: dict) -> dict:
         "created": meta.get("created", ""),
         "last_modified": meta.get("lastModified", ""),
         "blank_name": "Yes" if (given == "" and family == "") else "No",
+        "barcode": _extract_barcode(user),
+        "emails": emails,
     }
 
 
@@ -414,15 +538,265 @@ def run_review(lib_code: str, input_file: Path, output_dir: Path) -> Path:
     return out_path
 
 
+def _judge_candidate(fields: dict, expected: dict, searched_email: str) -> tuple:
+    """
+    Decide whether a record found for an exception email is a delete candidate.
+
+    Rule (agreed with the WVB workflow):
+      - a record that carries a barcode is treated as the REAL patron -> never
+        pre-flagged, only noted (even if the name is blank or differs)
+      - otherwise blank name -> candidate
+      - otherwise name differs from the exception row -> candidate
+      - otherwise (name matches, no barcode seen) -> not a candidate
+
+    Returns (name_matches, has_campus_correlation, delete_candidate, note).
+    """
+    given = fields["given_name"].strip().lower()
+    family = fields["family_name"].strip().lower()
+    name_matches = (
+        given == expected["given"].strip().lower()
+        and family == expected["family"].strip().lower()
+    )
+    id_parts = [p.strip().lower() for p in fields["id_at_source"].split("|") if p.strip()]
+    has_campus = searched_email.strip().lower() in id_parts
+    barcode = fields["barcode"]
+
+    if barcode:
+        note = f"has barcode {barcode} - real record? manual review"
+        if barcode == expected["barcode"]:
+            note += " (matches expected barcode)"
+        return name_matches, has_campus, False, note
+    if fields["blank_name"] == "Yes":
+        return name_matches, has_campus, True, "blank name"
+    if not name_matches:
+        return name_matches, has_campus, True, (
+            f"name '{fields['given_name']} {fields['family_name']}' differs from expected "
+            f"'{expected['given']} {expected['family']}', no barcode"
+        )
+    return name_matches, has_campus, False, "name matches, no barcode seen in API response"
+
+
+def _exception_row(base: dict, user: dict, expected: dict, email: str) -> dict:
+    """Build one review row for one record returned for an exception email."""
+    fields = extract_user_fields(user)
+    name_matches, has_campus, candidate, note = _judge_candidate(fields, expected, email)
+    row = dict(base)
+    row.update(fields)
+    row["search_type"] = "+".join(user.get("_found_via", []))
+    row["match_found"] = "Yes"
+    row["name_matches"] = "Yes" if name_matches else "No"
+    row["has_campus_correlation"] = "Yes" if has_campus else "No"
+    row["delete_candidate"] = "Yes" if candidate else "No"
+    row["notes"] = note
+    return row
+
+
+PPID_NEEDED_FIELDNAMES = [
+    "email", "expected_given_name", "expected_family_name", "expected_barcode", "ppid",
+]
+
+
+def _load_ppid_map(ppid_file: Path) -> dict:
+    """
+    Read an email -> PPID map (tab- or comma-delimited, with a header).
+    Accepts the *_ppid_needed_*.tsv template this tool writes, or any file with
+    'email' (or 'searched_value') and 'ppid' (or 'principal_id') columns.
+    Rows with an empty or non-UUID ppid are ignored.
+    """
+    text = ppid_file.read_text(encoding="utf-8")
+    delimiter = "\t" if "\t" in text.splitlines()[0] else ","
+    rows = list(csv.DictReader(text.splitlines(), delimiter=delimiter))
+
+    def col(row, *names):
+        for n in names:
+            for k, v in row.items():
+                if k and k.strip().lower() == n:
+                    return (v or "").strip()
+        return ""
+
+    mapping = {}
+    skipped = 0
+    for row in rows:
+        email = col(row, "email", "searched_value").lower()
+        ppid = col(row, "ppid", "principal_id")
+        if not email or not ppid:
+            continue
+        if not _UUID_PATTERN.match(ppid):
+            skipped += 1
+            logger.warning("Ignoring non-UUID ppid for %s: %r", email, ppid)
+            continue
+        mapping[email] = ppid
+    logger.info("Loaded %d email->PPID pair(s) from %s%s", len(mapping), ppid_file,
+                f" ({skipped} skipped)" if skipped else "")
+    return mapping
+
+
+def _failure_email(failure) -> str:
+    """The email to look up for a failed record: its idAtSource, else its username."""
+    return (failure.get("idAtSource") or failure.username).strip()
+
+
+def _review_exception_one(token: str, registry_id: str, failure, ppid: str,
+                          progress: str) -> list:
+    """
+    Look up one failed record's idAtSource email and return one review row per
+    record the API returns (or a single 'no match' row).
+
+    If *ppid* is given, that record is fetched directly (search cannot reach
+    ghosts); otherwise both search filters are tried.
+    """
+    email = _failure_email(failure)
+    expected = {
+        "given": failure.get("givenName"),
+        "family": failure.get("familyName"),
+        "barcode": failure.get("barcode"),
+    }
+    logger.info("%s %s: %s%s", progress, failure.error_type, email,
+                f" (direct PPID {ppid})" if ppid else "")
+
+    base = {fn: "" for fn in REVIEW_FIELDNAMES}
+    base.update({
+        "searched_value": email,
+        "expected_given_name": expected["given"],
+        "expected_family_name": expected["family"],
+        "expected_barcode": expected["barcode"],
+    })
+
+    if ppid:
+        result = get_user_by_id(token, registry_id, ppid)
+        if result.get("match_found"):
+            user = result["user"]
+            user["_found_via"] = ["principal_id"]
+            return [_exception_row(base, user, expected, email)]
+        row = dict(base)
+        row["search_type"] = "principal_id (direct lookup)"
+        row["match_found"] = "No"
+        row["principal_id"] = ppid
+        row["notes"] = f"PPID lookup failed: {result.get('error', '')[:150]}"
+        return [row]
+
+    users = search_all_matches(token, registry_id, email) if email else []
+    if not users:
+        row = dict(base)
+        row["search_type"] = "external_id + email (no match)"
+        row["match_found"] = "No"
+        row["notes"] = "no record found via External_ID or EMAIL_ADDRESS"
+        return [row]
+
+    return [_exception_row(base, user, expected, email) for user in users]
+
+
+def _write_ppid_needed(rows: list, failures: list, output_dir: Path, symbol: str,
+                       timestamp: str) -> Path:
+    """
+    Write the template of emails that still need a ghost PPID from WMS Admin:
+    every failure whose email produced no delete candidate. Returns None if
+    nothing is needed.
+    """
+    flagged = {r["searched_value"].lower() for r in rows if r["delete_candidate"] == "Yes"}
+    needed = []
+    seen = set()
+    for f in failures:
+        email = _failure_email(f).lower()
+        if not email or email in flagged or email in seen:
+            continue
+        seen.add(email)
+        needed.append({
+            "email": email,
+            "expected_given_name": f.get("givenName"),
+            "expected_family_name": f.get("familyName"),
+            "expected_barcode": f.get("barcode"),
+            "ppid": "",
+        })
+    if not needed:
+        return None
+
+    path = output_dir / f"{symbol}_ppid_needed_{timestamp}.tsv"
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=PPID_NEEDED_FIELDNAMES, delimiter="\t")
+        writer.writeheader()
+        writer.writerows(needed)
+    logger.info(
+        "%d email(s) have no ghost reachable by search; worklist written to %s. In WMS Admin, "
+        "search 'Name, ID, Email' for each email, open the 'Not supplied' record and delete it "
+        "there - or paste its PPID (WMS diagnostics -> Namespace/PPID) into the ppid column "
+        "and re-run with --ppid-file to delete through the API.", len(needed), path,
+    )
+    return path
+
+
+def _log_exception_summary(rows: list, n_failures: int, out_path: Path) -> None:
+    """Log counts after a --review-exception run and the next step."""
+    n_found = sum(1 for r in rows if r["match_found"] == "Yes")
+    n_candidates = sum(1 for r in rows if r["delete_candidate"] == "Yes")
+    n_nomatch = sum(1 for r in rows if r["match_found"] == "No")
+    n_barcode = sum(1 for r in rows if r["match_found"] == "Yes" and r["barcode"])
+    logger.info(
+        "Review complete: %s failure(s) checked -> %s record(s) found, "
+        "%s delete candidate(s), %s with a barcode (not flagged), %s email(s) with no match",
+        n_failures, n_found, n_candidates, n_barcode, n_nomatch,
+    )
+    logger.info("Review file written to: %s", out_path)
+    logger.info(
+        "Next step: open this file, verify the delete_candidate=Yes rows, type YES in "
+        "confirm_delete for the ones to remove, save, then run with --delete"
+    )
+
+
+def _read_token(lib_code: str) -> tuple:
+    """Return (read-only access token, registry_id) for lib_code."""
+    client_id, client_secret, registry_id = get_idm_credentials(lib_code)
+    return get_access_token(client_id, client_secret, scope="SCIM:read_user"), registry_id
+
+
+def _review_output_path(lib_code: str, output_dir: Path) -> tuple:
+    """Create output_dir and return (symbol, timestamp, review CSV path)."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    symbol = lib_code.split("_")[-1].upper()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return symbol, timestamp, output_dir / f"{symbol}_idm_review_{timestamp}.csv"
+
+
+def run_review_exception(lib_code: str, exception_file: Path, output_dir: Path,
+                         ppid_file: Path = None) -> Path:
+    """Step 1b: review every failed record in an OCLC exception report. Read-only."""
+    failures = parse_exception_report(exception_file)
+    if not failures:
+        raise ValueError(f"No failure entries found in {exception_file}")
+    logger.info("Failure types: %s", count_by_type(failures))
+    ppid_map = _load_ppid_map(ppid_file) if ppid_file else {}
+
+    token, registry_id = _read_token(lib_code)
+    symbol, timestamp, out_path = _review_output_path(lib_code, output_dir)
+
+    rows = []
+    for i, failure in enumerate(failures, start=1):
+        ppid = ppid_map.get(_failure_email(failure).lower(), "")
+        rows.extend(
+            _review_exception_one(token, registry_id, failure, ppid, f"[{i}/{len(failures)}]")
+        )
+    _write_csv(out_path, REVIEW_FIELDNAMES, rows)
+
+    _log_exception_summary(rows, len(failures), out_path)
+    _write_ppid_needed(rows, failures, output_dir, symbol, timestamp)
+    return out_path
+
+
 def _load_delete_candidates(review_file: Path) -> list:
-    """Read a reviewed CSV and return only the rows explicitly confirmed for deletion."""
+    """
+    Read a reviewed CSV and return only the rows explicitly confirmed for deletion:
+    confirm_delete = YES AND (blank_name = Yes OR delete_candidate = Yes) AND a principal_id.
+    """
     with open(review_file, "r", newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
 
     return [
         r for r in rows
-        if r.get("blank_name", "").strip().lower() == "yes"
-        and r.get("confirm_delete", "").strip().upper() == "YES"
+        if r.get("confirm_delete", "").strip().upper() == "YES"
+        and (
+            r.get("blank_name", "").strip().lower() == "yes"
+            or r.get("delete_candidate", "").strip().lower() == "yes"
+        )
         and r.get("principal_id", "").strip()
     ]
 
@@ -435,7 +809,15 @@ def _confirm_deletion(candidates: list, review_file: Path) -> bool:
     print(f"Review file: {review_file}")
     print(f"Records marked for deletion: {len(candidates)}\n")
     for r in candidates[:15]:
-        print(f"  - {r['searched_value']}  (principal_id: {r['principal_id']})")
+        name = f"{r.get('given_name', '')} {r.get('family_name', '')}".strip() or "(blank name)"
+        expected = f"{r.get('expected_given_name', '')} {r.get('expected_family_name', '')}".strip()
+        line = f"  - {r['searched_value']}  name={name!r}"
+        if expected:
+            line += f"  expected={expected!r}"
+        if r.get("barcode"):
+            line += f"  barcode={r['barcode']}"
+        line += f"  (principal_id: {r['principal_id']})"
+        print(line)
     if len(candidates) > 15:
         print(f"  ... and {len(candidates) - 15} more")
 
@@ -527,15 +909,35 @@ def main():
         help="Text file of barcodes/emails, one per line"
         )
     group.add_argument(
+        "--review-exception",
+        metavar="EXCEPTION_FILE",
+        help="An OCLC load exception report; looks up each failed record's idAtSource "
+             "email and pre-flags ghost records as delete candidates",
+        )
+    group.add_argument(
         "--delete",
         metavar="REVIEW_FILE",
-        help="A reviewed CSV from a previous --review run")
+        help="A reviewed CSV from a previous --review / --review-exception run")
+    p.add_argument(
+        "--ppid-file",
+        metavar="PPID_FILE",
+        help="With --review-exception: email->PPID file (the *_ppid_needed_*.tsv template "
+             "filled in from WMS Admin) so ghost records are fetched directly",
+        )
 
     args = p.parse_args()
     output_dir = Path(args.output_dir)
 
+    if args.ppid_file and not args.review_exception:
+        p.error("--ppid-file can only be used with --review-exception")
+
     if args.review:
         run_review(args.lib_code, Path(args.review), output_dir)
+    elif args.review_exception:
+        run_review_exception(
+            args.lib_code, Path(args.review_exception), output_dir,
+            Path(args.ppid_file) if args.ppid_file else None,
+        )
     else:
         run_delete(args.lib_code, Path(args.delete))
 

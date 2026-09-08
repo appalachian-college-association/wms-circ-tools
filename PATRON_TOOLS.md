@@ -62,6 +62,16 @@ These utility modules provide shared functionality across all patron tools. You 
 - Shows file statistics before upload
 - Logs all upload operations
 
+### exception_report.py
+
+**Purpose**: Parses OCLC patron-load exception reports (the `*.exception.*.txt` files under `reports/ABC/stats/`).
+
+**Key Functions**:
+- `parse_exception_report(path)` - Returns one `Failure` per "Error occurred..." block, with `error_type` (`COMPLETE_CREATE_FAILURE`, `DUPLICATE_BARCODE_ERROR`, or `OTHER`) and the echoed record's values by reload column name (`barcode`, `idAtSource`, `sourceSystem`, `givenName`, `familyName`, `username`, ...)
+- `count_by_type(failures)` - Counts per error type
+
+**Why this matters**: OCLC echoes each rejected record as a 46-column tab row in the same order as `headers_formattedpatron.txt`, so `build_patron_updates.py` and `idm_blank_patron_tool.py --review-exception` can read barcodes and emails from it by name instead of guessing positions.
+
 ---
 
 ## data_fetcher.py - Download Reports
@@ -404,6 +414,8 @@ python circ_patron_reload.py wx_abc --offline --use-source-value --upload-test  
 - `patron_barcode_old` = `Patron_Barcode` from the patron report (the barcode OCLC has on the record now).
 - `patron_barcode_new` = the *incoming* barcode from the exception row (the barcode your load tried to set). If the row cannot be read positionally, the old barcode is kept and a warning is logged.
 - `Patron_User_ID_At_Source` / `Patron_Source_System` are cleaned with the same first-part-of-pipe logic `circ_patron_reload.py --use-source-value` uses, so the values are identical to a normal reload.
+
+**`DUPLICATE_BARCODE_ERROR` rows** (an update matched a "ghost" record by idAtSource and could not give it the barcode) need no lookup at all: the echoed row already holds `barcode`, `idAtSource`, and `sourceSystem`, so they are copied straight into `patron_updates.txt` with `patron_barcode_old = patron_barcode_new`. A file containing only these rows does not need a patron report. Delete the ghost records first (see `idm_blank_patron_tool.py --review-exception`), then reload. Rows with any other error text are logged and skipped.
 
 ### Output
 
@@ -786,6 +798,47 @@ If more than one record matches, the row is flagged `MULTIPLE MATCHES FOUND` for
 manual review. Calls are paced at ~0.6s each to stay under OCLC's 120 req/min
 limit.
 
+### Review From an Exception Report (`--review-exception`)
+
+WVB's campus identity provider keeps creating "ghost" IDM records: `User ID at source` = the patron's `@bethanywv.edu` email, sourceSystem = `https://sts.windows.net/...`, and nothing else - no name, no barcode. The real patron record carries an OCLC GUID correlation. A reload that sends the campus pair matches the ghost, tries to give it the barcode, and fails with `DUPLICATE_BARCODE_ERROR`. The fix is to delete the ghost and reload; OCLC then matches the real record by barcode and adds the campus correlation.
+
+```bash
+python data_fetcher.py wx_abc --stats --recent 2
+# 1. Confirm the pattern: every failed email should resolve to ONE real record with the expected barcode
+python idm_blank_patron_tool.py wx_abc --review-exception reports/ABC/stats/ABC.D20260908.T1015.ABCpatronreload.exception.2026-09-08_101954.txt
+#   -> patrons/idm_review/ABC_idm_review_YYYYMMDD_HHMMSS.csv   (one row per record found)
+#   -> patrons/idm_review/ABC_ppid_needed_YYYYMMDD_HHMMSS.tsv  (worklist: email, expected name, expected barcode)
+# 2. Delete the ghosts in WMS Admin (see "Ghosts are not searchable" below)
+# 3. Rebuild patron_updates.txt for just the failed patrons and reload them
+python build_patron_updates.py wx_abc --exception-file reports/ABC/stats/ABC.D20260908.T1015.ABCpatronreload.exception.2026-09-08_101954.txt
+python circ_patron_reload.py wx_abc --offline
+python circ_patron_reload.py wx_abc --upload-file patrons/reloads/ABCpatronreload.txt
+```
+
+How it decides:
+- For each failed record, the `idAtSource` email is searched with **both** API filters (`External_ID`, then `EMAIL_ADDRESS`) and **every** record returned gets its own CSV row.
+- `delete_candidate = Yes` when the record has a **blank name**, or its name **differs** from the exception row **and** it has **no barcode**.
+- A record that carries a barcode is treated as the real patron and is **never** pre-flagged, even with a blank or different name; its note says `has barcode ... manual review`.
+- `--delete` accepts a row only when `confirm_delete = YES` **and** (`blank_name = Yes` **or** `delete_candidate = Yes`) **and** it has a `principal_id`, then still asks you to type `yes`.
+
+**Ghosts are not searchable - delete them in WMS Admin.** Tested against WVB's WSKey (2026-09-08): `External_ID` matches barcodes only and `EMAIL_ADDRESS` matches the `emails` attribute only, so a ghost (no barcode, no email attribute, just a correlation) is invisible to search; only the real patron comes back. The API has no list or wildcard query either. A ghost can be fetched **only by its PPID**, and nothing OCLC sends us contains that PPID.
+
+What the review run gives you anyway: confirmation that each failed email resolves to exactly one real record with the expected barcode and name (so the failure really is the ghost pattern and the "Not supplied" record is safe to remove), and a worklist:
+
+```
+patrons/idm_review/ABC_ppid_needed_YYYYMMDD_HHMMSS.tsv
+email	expected_given_name	expected_family_name	expected_barcode	ppid
+```
+
+**Recommended:** work down that list in WMS Admin - search **Name, ID, Email** for the address, open the **Not supplied** record, check *Account information* shows the campus sourceSystem + the email as User ID at source, and click **Delete account**. Since you are already on the record, this is faster than copying its PPID.
+
+**Optional batch path:** if you would rather delete through the API (large batch, or you want the delete log CSV), paste each ghost's PPID (**WMS diagnostics → Namespace/PPID**) into the `ppid` column and re-run:
+
+```bash
+python idm_blank_patron_tool.py wx_abc --review-exception <exception file> --ppid-file patrons/idm_review/ABC_ppid_needed_YYYYMMDD_HHMMSS.tsv
+```
+Emails with a PPID are fetched directly and judged against the exception row (a ghost comes back blank-name, no barcode → `delete_candidate = Yes`); rows with a blank or non-UUID `ppid` are skipped. Then confirm with YES and `--delete` as usual. The CSV shows the fetched record's name and barcode, so a mis-pasted PPID pointing at a real patron is visible before you type YES - and `--delete` refuses any record that has a barcode.
+
 ### Review CSV Columns
 
 | Column | Meaning |
@@ -801,7 +854,12 @@ limit.
 | `created`, `last_modified` | Record timestamps |
 | `blank_name` | `Yes` if both name fields are empty |
 | `confirm_delete` | **You fill this in** — type `YES` to authorize deletion |
-| `notes` | Warnings (e.g. multiple matches, search errors) |
+| `notes` | Warnings (e.g. multiple matches, search errors) or the reason for the `delete_candidate` decision |
+| `barcode`, `emails` | Barcode and email addresses on the record, if the API returns them (`--review-exception`) |
+| `expected_given_name`, `expected_family_name`, `expected_barcode` | Values from the exception row being checked (`--review-exception`) |
+| `name_matches` | `Yes` if the record's given+family name equals the exception row (case-insensitive) |
+| `has_campus_correlation` | `Yes` if the searched email appears as one of the record's `idAtSource` values |
+| `delete_candidate` | `Yes` if the record meets the delete rule above; `--delete` honours this **or** `blank_name` |
 
 ### Output Location
 

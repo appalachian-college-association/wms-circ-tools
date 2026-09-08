@@ -7,49 +7,40 @@ file for use with circ_patron_reload.py.
 
 PURPOSE
 -------
-When OCLC patron loads fail with:
+Two kinds of load failure are handled:
 
-    Error occurred while creating a new user... COMPLETE_CREATE_FAILURE :
-    new username is already used as a username by another user
+1. COMPLETE_CREATE_FAILURE : new username is already used as a username by another user
+   OCLC already has a record for that patron (matched by username/email) but the
+   incoming barcode does not match the barcode on the OCLC record. OCLC cannot
+   change the barcode unless the incoming record also supplies the system-level
+   match fields idAtSource and sourceSystem. For these rows the script looks the
+   username up in the newest full patron report to get the barcode OCLC has now
+   and the clean IdM source values.
 
-...it means OCLC already has a record for that patron (matched by username/email)
-but the incoming barcode does not match the barcode already on the OCLC record.
-OCLC cannot overwrite the barcode unless the incoming record also supplies the
-OCLC system-level match fields: idAtSource (the OCLC principalID/GUID) and
-sourceSystem (the OCLC IDM URN for this library).
+2. DUPLICATE_BARCODE_ERROR (on update)
+   OCLC matched the incoming idAtSource/sourceSystem to a different ("ghost")
+   record and could not give it the barcode because the real record owns it.
+   After the ghost is deleted (see idm_blank_patron_tool.py --review-exception),
+   the same patrons simply need to be loaded again. The echoed row already holds
+   barcode, idAtSource and sourceSystem, so these rows are copied straight into
+   patron_updates.txt with no patron-report lookup.
 
-This script:
-  1. Reads the exception report (.txt). Under each COMPLETE_CREATE_FAILURE
-     line OCLC echoes the rejected record as a 46-column tab-delimited row
-     (same layout as headers_formattedpatron.txt). We take the username and
-     the INCOMING barcode from that row. By default the newest
-     *.exception.*.txt for the symbol in reports/<SYMBOL>/stats/ is used.
-  2. Looks up each username (Patron_Username, falling back to
-     Patron_Email_Address) in the newest full patron report for the symbol
-     (reports/<SYMBOL>/patrons/<SYMBOL>.Circulation_Patron_Report_Full.YYYYMMDD.txt,
-     as downloaded by data_fetcher.py --patrons) to get the barcode currently
-     on the OCLC record plus its IdM source fields.
-  3. Cleans Patron_User_ID_At_Source / Patron_Source_System with the same
-     first-part-of-pipe logic circ_patron_reload.py --use-source-value applies
-     (patron_formatting.process_special_fields), so the values match what a
-     reload would produce.
-  4. Writes patron_updates.txt to the project root with the columns that
-     circ_patron_reload.py expects:
-         patron_barcode_old  patron_barcode_new  idAtSource  sourceSystem
-     where patron_barcode_old = Patron_Barcode from the patron report (the
-     barcode OCLC has now) and patron_barcode_new = the incoming barcode from
-     the exception row (the barcode the load tried to set).
+Both produce the four columns circ_patron_reload.py expects:
+
+    patron_barcode_old  patron_barcode_new  idAtSource  sourceSystem
 
 USAGE
 -----
     python data_fetcher.py wx_twy --patrons --recent     # newest full patron report
+                                                         # (needed for create-failure rows)
     python data_fetcher.py wx_twy --stats --recent 2     # newest load report + exception
     python build_patron_updates.py wx_twy --dry-run      # preview
     python build_patron_updates.py wx_twy                # write patron_updates.txt
 
     Optional flags:
       --exception-file   Path to exception report (auto-detected if omitted)
-      --patron-file      Path to a full patron report (auto-detected if omitted)
+      --patron-file      Path to a full patron report (auto-detected if omitted;
+                         only needed for COMPLETE_CREATE_FAILURE rows)
       --output-file      Output path (default: patron_updates.txt)
       --dry-run          Print results to console; do not write file
 
@@ -57,12 +48,12 @@ AFTER RUNNING
 -------------
 Review patron_updates.txt, then run the normal reload workflow:
 
-    python circ_patron_reload.py wx_twy --offline --use-source-value
+    python circ_patron_reload.py wx_twy --offline
 
 Because circ_patron_reload.py does an inner match on patron_barcode_old, the
-resulting reload file contains ONLY the patrons listed in patron_updates.txt.
-Remove or rename patron_updates.txt when you are done so it does not filter
-your next reload.
+resulting reload file contains ONLY the patrons listed in patron_updates.txt,
+and idAtSource/sourceSystem are taken from that file. Remove or rename
+patron_updates.txt when you are done so it does not filter your next reload.
 
 TERMINOLOGY NOTES (for Python beginners)
 -----------------------------------------
@@ -87,8 +78,11 @@ from typing import Optional
 import pandas as pd
 from dotenv import load_dotenv
 
-from file_utils import safe_read_txt, find_latest_patron_report, load_headers
+from file_utils import safe_read_txt, find_latest_patron_report
 from patron_formatting import process_special_fields
+from exception_report import (
+    parse_exception_report, count_by_type, DUPLICATE_BARCODE_ERROR, OTHER,
+)
 
 load_dotenv()
 
@@ -97,13 +91,6 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 
 logger = logging.getLogger(__name__)
-
-# Pattern that marks a failed-create line in the exception report.
-# re.IGNORECASE makes the match case-insensitive, just in case.
-_FAILURE_PATTERN = re.compile(
-    r"COMPLETE_CREATE_FAILURE\s*:\s*new username is already used",
-    re.IGNORECASE,
-)
 
 # OCLC stamps exception/report filenames with the run time, e.g.
 #   TWY.D20260903.T0409.TWU_Patron_Upload.exception.2026-09-03_041951.txt
@@ -118,14 +105,7 @@ _REQUIRED_PATRON_COLUMNS = {
     "Patron_Source_System",
 }
 
-# The data line under each failure header is the rejected record echoed back
-# in the 46-column tab-delimited reload layout (headers_formattedpatron.txt).
-# We read the column positions from that file so 'barcode' and 'username'
-# are found by name. If a data line does not have 46 tab-separated fields we
-# fall back to taking the last whitespace token as the username.
-_HEADERS_FILE = Path("headers_formattedpatron.txt")
-_BARCODE_COL = "barcode"
-_USERNAME_COL = "username"
+UPDATES_COLUMNS = ["patron_barcode_old", "patron_barcode_new", "idAtSource", "sourceSystem"]
 
 
 # ---------------------------------------------------------------------------
@@ -200,117 +180,22 @@ def _find_patron_report(symbol: str, patron_file: Optional[Path]) -> Path:
     Return the full patron report to match against.
 
     Uses --patron-file if given; otherwise the newest
-    <SYMBOL>.Circulation_Patron_Report_Full.YYYYMMDD.txt in reports/<SYMBOL>/patrons/.
+    <SYMBOL>.Circulation_Patron_Report_Full.YYYYMMDD.txt in patrons/downloads/
+    or reports/<SYMBOL>/patrons/ (newest date wins; patrons/downloads/ wins a tie).
     """
     if patron_file is not None:
         if not patron_file.exists():
             raise FileNotFoundError(f"--patron-file not found: {patron_file}")
         return patron_file
 
-    chosen, _ = find_latest_patron_report(symbol, [Path("reports") / symbol / "patrons"])
+    search_dirs = [Path("patrons") / "downloads", Path("reports") / symbol / "patrons"]
+    chosen, _ = find_latest_patron_report(symbol, search_dirs)
     return chosen
 
 
 # ---------------------------------------------------------------------------
-# Core parsing
+# Patron report
 # ---------------------------------------------------------------------------
-
-def _load_reload_column_index() -> Optional[dict]:
-    """
-    Map reload column name -> position (0-based) using headers_formattedpatron.txt.
-    Returns None (with a warning) if the headers file is missing or malformed.
-    """
-    if not _HEADERS_FILE.exists():
-        logger.warning(
-            "%s not found; cannot read incoming barcodes from the exception rows",
-            _HEADERS_FILE,
-        )
-        return None
-    headers = load_headers(_HEADERS_FILE)
-    index = {name: pos for pos, name in enumerate(headers)}
-    if _BARCODE_COL not in index or _USERNAME_COL not in index:
-        logger.warning(
-            "%s does not contain '%s' and '%s' columns", _HEADERS_FILE, _BARCODE_COL, _USERNAME_COL
-        )
-        return None
-    return index
-
-
-def _parse_data_line(data_line: str, col_index: Optional[dict]) -> Optional[dict]:
-    """
-    Pull username and incoming barcode out of one echoed reload row.
-
-    Returns {'username': ..., 'incoming_barcode': ...} or None if nothing usable.
-    incoming_barcode is '' when the row could not be read positionally.
-    """
-    fields = data_line.split("\t")
-
-    if col_index is not None and len(fields) == len(col_index):
-        username = fields[col_index[_USERNAME_COL]].strip()
-        barcode = fields[col_index[_BARCODE_COL]].strip()
-        if username:
-            return {"username": username, "incoming_barcode": barcode}
-
-    # Fallback: last whitespace token is the username; barcode unknown
-    tokens = [t for t in re.split(r"\s+", data_line.strip()) if t]
-    if not tokens:
-        return None
-    logger.warning(
-        "Data row did not have %s tab-delimited fields; using last token '%s' as "
-        "username and leaving incoming barcode blank",
-        len(col_index) if col_index else "the expected number of", tokens[-1],
-    )
-    return {"username": tokens[-1], "incoming_barcode": ""}
-
-
-def _parse_failures(exception_path: Path) -> list:
-    """
-    Read the exception report and return one dict per COMPLETE_CREATE_FAILURE
-    block: {'username': str, 'incoming_barcode': str}.
-
-    HOW THE EXCEPTION FILE IS STRUCTURED
-    Each failure looks like this (two lines):
-
-        Error occurred while creating a new user... COMPLETE_CREATE_FAILURE :
-        new username is already used as a username by another user
-            Adrian  Hutchins  ...  2782  w115100  ...  ahutchins@tnwesleyan.edu
-
-    The second line is the rejected record in the 46-column tab-delimited
-    reload layout. 'barcode' (the INCOMING barcode the load tried to set) and
-    'username' are read by position using headers_formattedpatron.txt.
-
-    The list may contain duplicate usernames; duplicates are removed later.
-    """
-    col_index = _load_reload_column_index()
-    failures = []
-    lines = exception_path.read_text(encoding="utf-8", errors="replace").splitlines()
-
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        if _FAILURE_PATTERN.search(line):
-            # The very next non-blank line is the patron data row
-            j = i + 1
-            while j < len(lines) and not lines[j].strip():
-                j += 1
-            if j < len(lines):
-                parsed = _parse_data_line(lines[j], col_index)
-                if parsed:
-                    logger.info(
-                        "Found failure: username=%s incoming_barcode=%s",
-                        parsed["username"], parsed["incoming_barcode"] or "(unknown)",
-                    )
-                    failures.append(parsed)
-                else:
-                    logger.warning(
-                        "COMPLETE_CREATE_FAILURE at line %d has no data line", i + 1
-                    )
-            i = j + 1
-        else:
-            i += 1
-
-    return failures
-
 
 def _load_patron_df(patron_path: Path) -> pd.DataFrame:
     """
@@ -370,90 +255,139 @@ def _match_username(username: str, patron_df: pd.DataFrame) -> pd.DataFrame:
     return matches
 
 
-def _build_updates_rows(failures: list, patron_df: pd.DataFrame) -> tuple:
+# ---------------------------------------------------------------------------
+# Building update rows
+# ---------------------------------------------------------------------------
+
+def _row_from_duplicate_barcode(failure) -> Optional[dict]:
     """
-    For each failure, look the username up in the patron report and build an
-    update row:
+    DUPLICATE_BARCODE_ERROR rows already carry everything we need.
+    Returns None if barcode / idAtSource / sourceSystem are not all present.
+    """
+    barcode = failure.get("barcode")
+    id_at_source = failure.get("idAtSource")
+    source_system = failure.get("sourceSystem")
+    if not (barcode and id_at_source and source_system):
+        return None
+    return {
+        "patron_barcode_old": barcode,
+        "patron_barcode_new": barcode,
+        "idAtSource": id_at_source,
+        "sourceSystem": source_system,
+    }
+
+
+def _row_from_patron_report(failure, patron_df: pd.DataFrame) -> Optional[dict]:
+    """
+    COMPLETE_CREATE_FAILURE rows: look the username up in the patron report.
       patron_barcode_old = Patron_Barcode from the report (what OCLC has now)
       patron_barcode_new = incoming barcode from the exception row (what the
                            load tried to set); falls back to the old barcode
                            if the exception row could not be read.
+    Returns None when the username is not found or has no barcode.
+    """
+    username = failure.username
+    matches = _match_username(username, patron_df)
 
-    Returns (rows, not_found) where:
-      - rows      : list of dicts ready to write to patron_updates.txt
-      - not_found : list of usernames that had no match in the patron report
+    if matches.empty:
+        logger.warning("No match in patron report for username: %s", username)
+        return None
+
+    if len(matches) > 1:
+        logger.warning(
+            "Multiple rows match username '%s' - using first match only", username
+        )
+
+    row = matches.iloc[0]
+    barcode = row.get("Patron_Barcode", "").strip()
+    if not barcode:
+        logger.warning(
+            "Username '%s' matched but Patron_Barcode is empty - skipping", username
+        )
+        return None
+
+    id_at_source = row.get("Patron_User_ID_At_Source", "").strip()
+    source_system = row.get("Patron_Source_System", "").strip()
+    if not id_at_source or not source_system:
+        logger.warning(
+            "Username '%s' has blank idAtSource/sourceSystem in the report - "
+            "OCLC may still reject this row", username
+        )
+
+    new_barcode = failure.get("barcode")
+    if not new_barcode:
+        logger.warning(
+            "Username '%s' has no incoming barcode in the exception row - "
+            "keeping current barcode %s", username, barcode
+        )
+        new_barcode = barcode
+    elif new_barcode == barcode:
+        logger.info(
+            "Username '%s': incoming barcode equals current barcode (%s); "
+            "only source fields will change", username, barcode
+        )
+
+    logger.info(
+        "Matched '%s' -> barcode %s -> %s idAtSource=%s sourceSystem=%s",
+        username, barcode, new_barcode, id_at_source, source_system,
+    )
+    return {
+        "patron_barcode_old": barcode,       # barcode on the OCLC record now
+        "patron_barcode_new": new_barcode,   # barcode the failed load tried to set
+        "idAtSource": id_at_source,
+        "sourceSystem": source_system,
+    }
+
+
+def _build_updates_rows(failures: list, get_patron_df) -> tuple:
+    """
+    Turn parsed failures into patron_updates.txt rows.
+
+    get_patron_df is a zero-argument function that loads the patron report on
+    first use (so a file with only DUPLICATE_BARCODE_ERROR rows never needs one).
+
+    Returns (rows, not_found) where not_found lists usernames that could not be
+    resolved.
     """
     rows = []
     not_found = []
-    seen = {}  # username -> incoming barcode already handled
+    seen_old = set()      # dedupe by patron_barcode_old
+    seen_users = set()    # dedupe COMPLETE_CREATE_FAILURE lookups by username
 
     for failure in failures:
-        username = failure["username"]
-        incoming = failure["incoming_barcode"]
+        if failure.error_type == OTHER:
+            logger.warning(
+                "Line %d: unrecognised error type, skipped: %s",
+                failure.line_no, failure.error_text[:120],
+            )
+            continue
 
-        if username in seen:
-            if incoming and seen[username] and incoming != seen[username]:
+        row = None
+        if failure.error_type == DUPLICATE_BARCODE_ERROR:
+            row = _row_from_duplicate_barcode(failure)
+            if row is None:
                 logger.warning(
-                    "Username '%s' appears again with a different incoming barcode "
-                    "(%s vs %s) - keeping the first", username, seen[username], incoming
+                    "Line %d: %s row missing barcode/idAtSource/sourceSystem; "
+                    "falling back to the patron report", failure.line_no, DUPLICATE_BARCODE_ERROR
                 )
-            continue
-        seen[username] = incoming
 
-        matches = _match_username(username, patron_df)
+        if row is None:
+            username = failure.username
+            if not username or username in seen_users:
+                continue
+            seen_users.add(username)
+            row = _row_from_patron_report(failure, get_patron_df())
+            if row is None:
+                not_found.append(username)
+                continue
 
-        if matches.empty:
-            logger.warning("No match in patron report for username: %s", username)
-            not_found.append(username)
-            continue
-
-        if len(matches) > 1:
-            logger.warning(
-                "Multiple rows match username '%s' - using first match only", username
-            )
-
-        row = matches.iloc[0]
-        barcode = row.get("Patron_Barcode", "").strip()
-
-        if not barcode:
-            logger.warning(
-                "Username '%s' matched but Patron_Barcode is empty - skipping", username
-            )
-            not_found.append(username)
-            continue
-
-        id_at_source = row.get("Patron_User_ID_At_Source", "").strip()
-        source_system = row.get("Patron_Source_System", "").strip()
-        if not id_at_source or not source_system:
-            logger.warning(
-                "Username '%s' has blank idAtSource/sourceSystem in the report - "
-                "OCLC may still reject this row", username
-            )
-
-        new_barcode = incoming
-        if not new_barcode:
-            logger.warning(
-                "Username '%s' has no incoming barcode in the exception row - "
-                "keeping current barcode %s", username, barcode
-            )
-            new_barcode = barcode
-        elif new_barcode == barcode:
+        if row["patron_barcode_old"] in seen_old:
             logger.info(
-                "Username '%s': incoming barcode equals current barcode (%s); "
-                "only source fields will change", username, barcode
+                "Duplicate barcode %s in exception file - kept once", row["patron_barcode_old"]
             )
-
-        rows.append({
-            "patron_barcode_old": barcode,       # barcode on the OCLC record now
-            "patron_barcode_new": new_barcode,   # barcode the failed load tried to set
-            "idAtSource":   id_at_source,
-            "sourceSystem": source_system,
-        })
-
-        logger.info(
-            "Matched '%s' -> barcode %s -> %s idAtSource=%s sourceSystem=%s",
-            username, barcode, new_barcode, id_at_source, source_system,
-        )
+            continue
+        seen_old.add(row["patron_barcode_old"])
+        rows.append(row)
 
     return rows, not_found
 
@@ -463,32 +397,24 @@ def _build_updates_rows(failures: list, patron_df: pd.DataFrame) -> tuple:
 # ---------------------------------------------------------------------------
 
 def _write_updates_file(rows: list, output_path: Path) -> None:
-    """
-    Write patron_updates.txt as a tab-delimited file.
-
-    The columns match exactly what circ_patron_reload.py's
-    load_patron_updates() expects.
-    """
-    fieldnames = [
-        "patron_barcode_old",
-        "patron_barcode_new",
-        "idAtSource",
-        "sourceSystem",
-    ]
+    """Write patron_updates.txt as a tab-delimited file."""
     with output_path.open("w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fieldnames, delimiter="\t")
+        writer = csv.DictWriter(fh, fieldnames=UPDATES_COLUMNS, delimiter="\t")
         writer.writeheader()
         writer.writerows(rows)
 
     logger.info("Wrote %d row(s) to %s", len(rows), output_path)
 
 
-def _print_summary(rows: list, not_found: list, output_path: Path, lib_code: str) -> None:
+def _print_summary(rows: list, not_found: list, type_counts: dict,
+                   output_path: Path, lib_code: str) -> None:
     """Print a human-readable summary to the console."""
     print()
     print("=" * 60)
     print("SUMMARY")
     print("=" * 60)
+    for label, n in type_counts.items():
+        print(f"{label:<32}: {n}")
     print(f"Rows written to {output_path} : {len(rows)}")
     changed = sum(1 for r in rows if r["patron_barcode_old"] != r["patron_barcode_new"])
     print(f"Rows where the barcode will change : {changed}")
@@ -511,7 +437,7 @@ def _print_summary(rows: list, not_found: list, output_path: Path, lib_code: str
     if rows:
         print("NEXT STEP:")
         print(f"  Review {output_path}, then run:")
-        print(f"    python circ_patron_reload.py {lib_code} --offline --use-source-value")
+        print(f"    python circ_patron_reload.py {lib_code} --offline")
         print(f"  The reload file will contain ONLY the patrons in {output_path}.")
     print("=" * 60)
     print()
@@ -548,9 +474,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=(
-            "Path to a full patron report to match against. If omitted, the newest "
-            "<SYMBOL>.Circulation_Patron_Report_Full.YYYYMMDD.txt in "
-            "reports/<SYMBOL>/patrons/ is used."
+            "Full patron report to match COMPLETE_CREATE_FAILURE usernames against. "
+            "If omitted, the newest <SYMBOL>.Circulation_Patron_Report_Full.YYYYMMDD.txt "
+            "in patrons/downloads/ or reports/<SYMBOL>/patrons/ is used. Not needed "
+            "for DUPLICATE_BARCODE_ERROR rows."
         ),
     )
     p.add_argument(
@@ -590,32 +517,33 @@ def main(argv=None) -> None:
         exception_path = _find_exception_file(symbol)
     logger.info("Using exception file: %s", exception_path)
 
-    # --- Locate patron report ---
-    patron_path = _find_patron_report(symbol, args.patron_file)
-    logger.info("Using patron report: %s", patron_path)
-
     # --- Parse failures ---
-    failures = _parse_failures(exception_path)
+    failures = parse_exception_report(exception_path)
     if not failures:
         logger.error(
-            "No COMPLETE_CREATE_FAILURE entries found in '%s'. "
+            "No failure entries found in '%s'. "
             "Check that the file is the correct exception report.",
             exception_path,
         )
         sys.exit(1)
+    type_counts = count_by_type(failures)
 
-    unique_usernames = {f["username"] for f in failures}
-    logger.info("Found %d unique failure username(s) to look up", len(unique_usernames))
+    # --- Patron report: loaded only if a row needs it ---
+    cache = {}
 
-    # --- Load patron report (validates columns, cleans source fields) ---
-    patron_df = _load_patron_df(patron_path)
+    def get_patron_df() -> pd.DataFrame:
+        if "df" not in cache:
+            patron_path = _find_patron_report(symbol, args.patron_file)
+            logger.info("Using patron report: %s", patron_path)
+            cache["df"] = _load_patron_df(patron_path)
+        return cache["df"]
 
     # --- Build update rows ---
-    rows, not_found = _build_updates_rows(failures, patron_df)
+    rows, not_found = _build_updates_rows(failures, get_patron_df)
 
     if not rows:
         logger.error(
-            "None of the failure usernames matched a patron in the patron report. "
+            "No usable rows could be built from the exception report. "
             "Cannot build patron_updates.txt."
         )
         sys.exit(1)
@@ -624,18 +552,13 @@ def main(argv=None) -> None:
     if args.dry_run:
         print()
         print("DRY RUN - output not written. Rows that would be written:")
-        print("\t".join(
-            ["patron_barcode_old", "patron_barcode_new", "idAtSource", "sourceSystem"]
-        ))
+        print("\t".join(UPDATES_COLUMNS))
         for r in rows:
-            print("\t".join([
-                r["patron_barcode_old"], r["patron_barcode_new"],
-                r["idAtSource"], r["sourceSystem"],
-            ]))
+            print("\t".join(r[c] for c in UPDATES_COLUMNS))
     else:
         _write_updates_file(rows, args.output_file)
 
-    _print_summary(rows, not_found, args.output_file, args.lib_code)
+    _print_summary(rows, not_found, type_counts, args.output_file, args.lib_code)
 
 
 if __name__ == "__main__":

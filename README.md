@@ -28,6 +28,7 @@ These tools are designed for library staff working with WMS circulation data, wi
 - **`sftp_utils.py`** - Shared SFTP connection and file transfer functions
 - **`file_utils.py`** - File reading, parsing, and data cleaning utilities
 - **`data_loader.py`** - Upload processed files back to OCLC sFTP
+- **`exception_report.py`** - Parse OCLC load exception reports (error type + the echoed record's fields)
 
 ### Configuration Files
 - **`headers_formattedpatron.txt`** - Column headers for patron reload files (46 fields)
@@ -166,6 +167,22 @@ python check_source.py wx_abc --dry-run
 python check_source.py wx_abc
 
 # Reload ONLY those patrons; review patrons/reloads/ABCpatronreload.txt before uploading
+python circ_patron_reload.py wx_abc --offline
+python circ_patron_reload.py wx_abc --upload-file patrons/reloads/ABCpatronreload.txt
+```
+
+### Fix DUPLICATE_BARCODE_ERROR Load Failures (ghost IDM records)
+```bash
+# IDM API key required in .env as ABC_IDM_CLIENT_ID and ABC_IDM_CLIENT_SECRET
+# 1. Confirm each failed email resolves to one real record with the expected barcode, and get a worklist
+#    (patrons/idm_review/ABC_ppid_needed_*.tsv). The API cannot search ghosts, so it will not list them.
+python idm_blank_patron_tool.py wx_abc --review-exception reports/ABC/stats/ABC.[...].exception.[...].txt
+
+# 2. In WMS Admin, for each email on the worklist: search Name, ID, Email -> open the "Not supplied" record
+#    -> Delete account. (Optional API batch path with --ppid-file / --delete: see PATRON_TOOLS.md)
+
+# 3. Rebuild patron_updates.txt for just those patrons (values come from the exception rows) and reload
+python build_patron_updates.py wx_abc --exception-file reports/ABC/stats/ABC.[...].exception.[...].txt
 python circ_patron_reload.py wx_abc --offline
 python circ_patron_reload.py wx_abc --upload-file patrons/reloads/ABCpatronreload.txt
 ```
